@@ -5,7 +5,14 @@
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { CheckoutSession, PayerAttempt, PaymentIntent, PUBLIC_ROUTES, PublicCheckoutSession } from "@nearpay/spec";
+import {
+  CheckoutSession,
+  PayerAttempt,
+  PaymentIntent,
+  PUBLIC_ROUTES,
+  PublicCheckoutSession,
+  streamCheckoutSession,
+} from "@nearpay/spec";
 import { unhandledSubjects } from "@nearpay-internal/bus";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { unimplementedRoutes } from "@nearpay-internal/service";
@@ -13,16 +20,9 @@ import { INTERNAL_ROUTES, SUBJECTS, type Subject } from "@nearpay-internal/spec"
 import { USDC_NEAR } from "@nearpay-internal/testing";
 import { describe, expect, it } from "vitest";
 import { paymentsRoutes } from "../../src/api/routes.js";
-import {
-  type AttemptRow,
-  type IntentRow,
-  intentView,
-  payerAttempt,
-  publicSession,
-  type SessionRow,
-  sessionView,
-} from "../../src/app/views.js";
+import { intentView, payerAttempt, publicSession, sessionView } from "../../src/app/views.js";
 import { paymentsHandlers } from "../../src/consumers/handlers.js";
+import { attemptRow, intentRow, sessionRow } from "../support/rows.js";
 
 const ALL = [...PUBLIC_ROUTES, ...INTERNAL_ROUTES];
 
@@ -57,122 +57,7 @@ describe("routes and events", () => {
   });
 });
 
-// ---- objects: rows as the database returns them → views → spec schemas
-const now = new Date();
-const intentRow = (o: Partial<IntentRow> = {}): IntentRow => ({
-  id: uuidv7(),
-  account_id: uuidv7(),
-  livemode: false,
-  status: "succeeded",
-  amount: "200",
-  currency: "usd",
-  pricing_asset_id: null,
-  pricing_asset_amount: null,
-  description: "Flat white",
-  customer_id: null,
-  source: "checkout",
-  invoice_id: null,
-  payment_link_id: null,
-  destination_snapshot: {
-    sd_id: fromUuid("sd", uuidv7()),
-    asset_id: USDC_NEAR,
-    type: "intents_account",
-    chain: "near:mainnet",
-    address: "acme.near",
-    address_norm: "acme.near",
-    attestation_hash: null,
-    verification: "test",
-    per_payment_cap_usd_micros: null,
-  },
-  fee_snapshot: { schedule: {} as never, bearer: "payer" },
-  settings_snapshot: { late_payments: false, underpay_tolerance_bps: 0 },
-  settlement_asset_id: USDC_NEAR,
-  settlement_decimals: 6,
-  settlement_symbol: "USDC",
-  amount_settled: "2000042",
-  amount_refunded: "0",
-  amount_refund_pending: "0",
-  succeeded_attempt_id: null,
-  succeeded_at: now,
-  late: false,
-  canceled_at: null,
-  cancellation_reason: null,
-  review_reason: null,
-  compliance_review: null,
-  metadata: { order: "42" },
-  sequence: 3,
-  created_at: now,
-  updated_at: now,
-  version: 3,
-  ...o,
-});
-const attemptRow = (intent: IntentRow, o: Partial<AttemptRow> = {}): AttemptRow => ({
-  id: uuidv7(),
-  payment_intent_id: intent.id,
-  account_id: intent.account_id,
-  livemode: false,
-  method: "route_quote",
-  status: "awaiting_deposit",
-  visible: true,
-  origin_asset_id: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
-  origin_chain: "eip155:8453",
-  refund_to: "0x2222222222222222222222222222222222222222",
-  refund_type: "origin_chain",
-  payer_wallet: null,
-  payer_ip_country: null,
-  agent: false,
-  execution_id: `ex_${"0".repeat(26)}`,
-  execution_version: 1,
-  applied_fee_bps: 50,
-  route_class: "stable_pair",
-  settlement_amount: "2000042",
-  amount_tag: "42",
-  price_snapshot: null,
-  deposit: {
-    address: "0x1111111111111111111111111111111111111111",
-    memo: null,
-    amount_in: "2010042",
-    min_amount_in: "2010042",
-    deadline: new Date(Date.now() + 600_000).toISOString(),
-    chain: "eip155:8453",
-  },
-  intents_requirement: null,
-  deadline: new Date(Date.now() + 600_000),
-  settled_amount: null,
-  refunded_amount: null,
-  evidence: null,
-  failure_code: null,
-  is_overpayment: false,
-  overpayment_reason: null,
-  created_at: now,
-  updated_at: now,
-  version: 1,
-  ...o,
-});
-const sessionRow = (intent: IntentRow, o: Partial<SessionRow> = {}): SessionRow => ({
-  id: uuidv7(),
-  account_id: intent.account_id,
-  livemode: false,
-  payment_intent_id: intent.id,
-  status: "complete",
-  client_secret_hash: Buffer.alloc(32),
-  ui_mode: "hosted",
-  success_url: "https://shop.example/thanks",
-  cancel_url: null,
-  expires_at: now,
-  customer_email_enc: null,
-  locale: null,
-  allowed_origins: [],
-  completed_at: now,
-  late: false,
-  live_attempts_count: 0,
-  metadata: {},
-  created_at: now,
-  updated_at: now,
-  version: 2,
-  ...o,
-});
-
+// ---- objects: rows as the database returns them → views → spec schemas (0.1.5)
 describe("objects", () => {
   it("payment intents (events and API) parse, including overpayments and asset pricing", () => {
     const i = intentRow();
@@ -206,6 +91,9 @@ describe("objects", () => {
     const bus = sessionView(s, i);
     expect(SUBJECTS["evt.payments.checkout_session.completed"].object.safeParse(bus).success).toBe(true);
     expect(bus.client_secret).toBeNull();
+    // 0.1.5: optional in the schema for 0.1.4 readers, but servers MUST send it
+    expect(CheckoutSession.parse(bus).sequence).toBe(s.version);
+    expect(SUBJECTS["evt.payments.checkout_session.expired"].object.parse(bus)).toHaveProperty("sequence", s.version);
     const created = sessionView(s, i, {
       secret: `${fromUuid("cs", s.id)}_secret_${"a".repeat(32)}`,
       url: "https://pay.nearpay.localhost/c/x#y",
@@ -220,6 +108,12 @@ describe("objects", () => {
     expect(PayerAttempt.safeParse(a).success).toBe(true);
     const pub = publicSession(sessionRow(i, { status: "open", completed_at: null }), i, "Acme Coffee", a);
     expect(PublicCheckoutSession.safeParse(pub).success).toBe(true);
+    // 0.1.5: the public session (also the SSE `session` event) names its payment intent
+    const sessionEvent = streamCheckoutSession.stream?.events.session as typeof PublicCheckoutSession;
+    expect(sessionEvent).toBe(PublicCheckoutSession);
+    expect(sessionEvent.parse(pub).payment_intent).toBe(fromUuid("pi", i.id));
+    const { payment_intent: _, ...pre015 } = pub;
+    expect(PublicCheckoutSession.safeParse(pre015).success).toBe(false);
     expect(JSON.stringify(pub)).not.toContain("acme.near");
   });
 });

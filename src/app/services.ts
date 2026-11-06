@@ -116,6 +116,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
       (config.turnstileSecret
         ? turnstileClient({
             secret: config.turnstileSecret,
+            env: config.env,
             ...(config.turnstileBaseUrl ? { baseUrl: config.turnstileBaseUrl } : {}),
             ...f,
           })

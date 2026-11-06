@@ -2,6 +2,11 @@
  * Cloudflare Turnstile siteverify (lld/payments.md §8.2, §10: 2 s, 1 retry, breaker). An outage
  * (timeout, 5xx, open breaker) is reported as `unavailable`: the attempt proceeds under a stricter
  * per-IP limit (F-12) instead of blocking every payer.
+ *
+ * Cloudflare's documented test secrets behave deterministically, so outside the server stage they
+ * are answered locally, as identity does (identity LLD §11): `1x…AA` always passes, `2x…AA` always
+ * fails, `3x…AA` reports a spent token. The local stack then needs no egress to Cloudflare, and an
+ * offline machine does not fall into the outage limit after five attempts.
  */
 import { randomUUID } from "node:crypto";
 import { HttpError, httpClient } from "@nearpay-internal/http";
@@ -14,7 +19,24 @@ export interface Turnstile {
 
 export const SITEVERIFY = "https://challenges.cloudflare.com";
 
-export function turnstileClient(o: { secret: string; baseUrl?: string; fetch?: typeof fetch }): Turnstile {
+/** Cloudflare's test secrets and the result siteverify gives for any token. */
+export const TEST_SECRETS: Readonly<Record<string, TurnstileResult>> = {
+  "1x0000000000000000000000000000000AA": "ok",
+  "2x0000000000000000000000000000000AA": "failed",
+  "3x0000000000000000000000000000000AA": "failed",
+};
+
+export function turnstileClient(o: {
+  secret: string;
+  /** `NP_ENV`: test secrets are answered locally except on the server. */
+  env: "local" | "server" | "test";
+  baseUrl?: string;
+  fetch?: typeof fetch;
+}): Turnstile {
+  if (o.env !== "server" && Object.hasOwn(TEST_SECRETS, o.secret)) {
+    const result = TEST_SECRETS[o.secret] as TurnstileResult;
+    return { verify: async () => result };
+  }
   const c = httpClient({
     target: "turnstile",
     baseUrl: o.baseUrl ?? SITEVERIFY,

@@ -143,6 +143,9 @@ export function sessionView(
     locale: s.locale,
     completed_at: unixOrNull(s.completed_at),
     late: s.late,
+    // the session's aggregate version: every session change goes through updateSession, which bumps it,
+    // and it is the `aggregate.version` its events carry (0.1.5, CR-15-09)
+    sequence: s.version,
     metadata: s.metadata,
   } as Session;
 }
@@ -183,6 +186,7 @@ export function publicSession(
     asset_id: p.asset_id,
     display: { merchant_name_unverified: merchantName, description: i.description },
     expires_at: s.expires_at.toISOString(),
+    payment_intent: fromUuid("pi", i.id),
     settlement: {
       asset_id: i.settlement_asset_id,
       chain: i.destination_snapshot.chain,

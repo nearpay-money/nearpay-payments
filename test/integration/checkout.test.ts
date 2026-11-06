@@ -50,6 +50,7 @@ describe("checkout sessions (merchant)", () => {
       amount: 200,
       currency: "usd",
       ui_mode: "hosted",
+      sequence: 1,
     });
     expect(r.body.url).toBe(`https://pay.nearpay.localhost/c/${r.body.id}#${r.body.client_secret}`);
     const e = await expectEvent(probe, "evt.payments.payment_intent.created", {
@@ -118,6 +119,7 @@ describe("paying (payer → rails → worker)", () => {
       display: { merchant_name_unverified: "Acme Coffee" },
       settlement: { asset_id: USDC_NEAR, type: "intents_account" },
       attempt: null,
+      payment_intent: r.body.payment_intent,
     });
     expect(JSON.stringify(pub.body)).not.toContain("acme.near");
     expect(
@@ -194,9 +196,14 @@ describe("paying (payer → rails → worker)", () => {
     await expectEvent(probe, "evt.payments.payment_intent.succeeded", {
       data: { object: { id: r.body.payment_intent, status: "succeeded", amount_settled: "2000042" } },
     });
-    await expectEvent(probe, "evt.payments.checkout_session.completed", {
+    const completed = await expectEvent(probe, "evt.payments.checkout_session.completed", {
       data: { object: { id: cs, status: "complete", url: null, client_secret: null } },
     });
+    // sequence (0.1.5) = the session's aggregate version: on the bus object and the API view alike
+    const seq = (completed.data.object as { sequence: number }).sequence;
+    expect(seq).toBe(completed.aggregate.version);
+    expect(seq).toBeGreaterThan(r.body.sequence as number);
+    expect((await st.call("GET", `/v1/checkout/sessions/${cs}`, { token })).body.sequence).toBe(seq);
 
     const intent = await st.call("GET", `/v1/payment_intents/${r.body.payment_intent}`, { token });
     expect(intent.body).toMatchObject({
@@ -312,8 +319,11 @@ describe("merchant actions and jobs", () => {
 
   it("expires an open session on request", async () => {
     const { token, r } = await session();
+    const before = await st.call("GET", `/v1/checkout/sessions/${r.body.id}`, { token });
+    expect(before.body.sequence).toBe(r.body.sequence);
     const e = await st.call("POST", `/v1/checkout/sessions/${r.body.id}/expire`, { token, body: {} });
     expect(e.body.status).toBe("expired");
+    expect(e.body.sequence).toBeGreaterThan(before.body.sequence);
     const pi = await st.call("GET", `/v1/payment_intents/${r.body.payment_intent}`, { token });
     expect(pi.body.status).toBe("expired");
   });
@@ -424,6 +434,8 @@ describe("payer stream (SSE)", () => {
     };
     await until("event: session");
     await until("event: intent");
+    const snapshot = /event: session\ndata: (.*)\n/.exec(text)?.[1] as string;
+    expect(JSON.parse(snapshot)).toMatchObject({ id: cs, payment_intent: r.body.payment_intent });
     await st.call("POST", `/v1/checkout/sessions/${cs}/public/attempts`, {
       secret,
       body: {

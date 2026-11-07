@@ -8,20 +8,28 @@ import { generateKeyPairSync, type KeyObject, randomBytes } from "node:crypto";
 import { type Bus, connectBus, type Envelope, publish } from "@nearpay-internal/bus";
 import { createDb, type Database, migrate } from "@nearpay-internal/db";
 import { fromUuid, newId, toUuid } from "@nearpay-internal/ids";
+import { makeNonce } from "@nearpay-internal/intents";
 import type { Service } from "@nearpay-internal/service";
 import {
   createExecution,
+  createInternalCase,
+  createRefundExecution,
   type Execution,
+  estimateSettlement,
   getDestinationMinimums,
+  getEvidenceSummary,
   getGeoPolicy,
   getInternalAsset,
   getSettlementContext,
   INTERNAL_ROUTES,
   listChainProfiles,
+  listEvidence,
+  listFxRates,
   listInternalOptions,
   relaySignedIntent,
   sandboxAdvance,
   sandboxSimulateDeposit,
+  sandboxSimulateIntentsTransfer,
   signalExecution,
   submitExecutionDepositTx,
 } from "@nearpay-internal/spec";
@@ -32,7 +40,10 @@ import {
   execution,
   internalSettlementDestination,
   type MockPeer,
+  mintOpsToken,
+  mintServiceToken,
   mintTestToken,
+  mockError,
   mockPeer,
   provisionServiceDatabase,
   type Started,
@@ -81,8 +92,18 @@ export interface Stack {
     type?: "chain_address" | "intents_account";
   }): Merchant;
   token(m: Merchant, o?: { livemode?: boolean }): Promise<string>;
+  /** A dashboard session token (role, optional fresh step-up). */
+  sessionToken(m: Merchant, o?: { livemode?: boolean; role?: string; stepUp?: boolean }): Promise<string>;
+  /** A service token of `service` (its catalogue scopes). */
+  serviceToken(service: string): Promise<string>;
+  /** A console operator token. */
+  opsToken(o?: { role?: "ops" | "ops_admin"; stepUp?: boolean }): Promise<string>;
+  /** Makes the next `n` refund-leg creates fail transiently / answer a definitive error. */
+  failRefundCreates(n: number, code?: string): void;
+  /** Day (`YYYY-MM-DD`) rails files evidence under, and whether that day is complete. */
+  evidenceDay: { day: string; complete: boolean };
   call(
-    method: "GET" | "POST",
+    method: "GET" | "POST" | "PATCH" | "DELETE",
     path: string,
     o?: { body?: unknown; token?: string | null; secret?: string; headers?: Record<string, string> },
     // biome-ignore lint/suspicious/noExplicitAny: responses are asserted structurally in tests
@@ -170,6 +191,9 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
 
   const executions = new Map<string, Execution>();
   let failCreates = 0;
+  let failRefunds = 0;
+  let failRefundCode: string | undefined;
+  const evidenceDay = { day: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), complete: true };
   const rails = await mockPeer({ service: "rails", routes: INTERNAL_ROUTES });
   rails.on(getInternalAsset, async (ctx) => {
     const base = ctx.params.asset_id === USDC_BASE;
@@ -308,6 +332,167 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     executions.set(x.id, x);
     return x;
   });
+  rails.on(createRefundExecution, async (ctx) => {
+    const b = ctx.body;
+    if (failRefunds > 0) {
+      failRefunds--;
+      if (failRefundCode) mockError(failRefundCode as never);
+      throw new Error("rails is down");
+    }
+    const existing = [...executions.values()].find((x) => (x as { _key?: string })._key === b.idempotency_key);
+    if (existing) return existing;
+    const intentsSource = b.source.type === "intents_account";
+    const binding = `np1:${base58(44)}`;
+    const deadline = new Date(Date.now() + 1_800_000).toISOString();
+    const x = execution({
+      kind: "refund",
+      method: b.method,
+      account_id: b.account_id,
+      livemode: b.livemode,
+      state: "awaiting_deposit",
+      version: 1,
+      route_class: b.method === "intents_transfer" ? "intents_transfer" : "stable_pair",
+      applied_fee_bps: 0,
+      origin: {
+        asset_id: b.source.asset_id,
+        chain: b.source.chain,
+        refund_to: b.source.address,
+        refund_type: "intents",
+      },
+      settlement: {
+        asset_id: b.recipient.asset_id,
+        amount_base: b.amount,
+        tag: "0",
+        expected: b.amount,
+        recipient: b.recipient.address,
+        recipient_type: b.recipient.type === "intents" ? "intents" : "destination_chain",
+        chain: b.recipient.chain,
+      },
+      deposit: intentsSource
+        ? null
+        : {
+            address: "0x3333333333333333333333333333333333333333",
+            memo: null,
+            amount_in: b.amount,
+            min_amount_in: b.amount,
+            deadline,
+            chain: b.source.chain,
+          },
+      intents_requirement: null,
+      deadline,
+      settled_amount: null,
+      refunded_amount: null,
+      evidence: null,
+      reference: { ...b.reference, payment_attempt: b.reference.payment_attempt },
+      refund: {
+        swap_type: b.method === "intents_transfer" ? null : b.swap_type,
+        amount: b.amount,
+        amount_out_expected: b.amount,
+        min_amount_out: null,
+        token: intentsSource ? null : { standard: "erc20", address: "0x4444444444444444444444444444444444444444" },
+        transfer: intentsSource
+          ? {
+              signer_id: b.source.address,
+              receiver_id: b.method === "intents_transfer" ? b.recipient.address : "deposit-1click.near",
+              token: b.source.asset_id,
+              amount: b.amount,
+              memo: binding,
+              deadline,
+            }
+          : null,
+      },
+    } as never);
+    Object.defineProperty(x, "_key", { value: b.idempotency_key, enumerable: false });
+    executions.set(x.id, x);
+    return x;
+  });
+  rails.on(listFxRates, async (ctx) => {
+    const lm = ctx.query.livemode as unknown as boolean | undefined;
+    const rate = (currency: string, available: boolean, stale: boolean) => ({
+      currency,
+      exponent: currency === "jpy" ? 0 : 2,
+      available,
+      stale,
+      reference_date: "2026-11-06",
+      rate: available
+        ? {
+            base: currency,
+            quote: "usd",
+            kind: "fx",
+            role: "reference",
+            source: "fixed",
+            value: { num: "11", den: "10" },
+            decimal: "1.1",
+            as_of: new Date().toISOString(),
+            fetched_at: new Date().toISOString(),
+            valid_until: new Date(Date.now() + 86_400_000).toISOString(),
+          }
+        : null,
+    });
+    return {
+      base: "usd",
+      livemode: lm ?? false,
+      currencies: [rate("usd", true, false), rate("eur", true, false), rate("gbp", true, true)],
+      as_of: new Date().toISOString(),
+    } as never;
+  });
+  rails.on(estimateSettlement, async (ctx) => {
+    const q = ctx.query as unknown as { amount: string; currency: string; settlement_asset?: string };
+    if (q.currency === "chf") mockError("currency_unsupported");
+    const micros = (BigInt(q.amount) * 11n * 10_000n) / 10n; // eur cents × 1.1 → USD micros
+    return {
+      pricing: { amount: Number(q.amount), currency: q.currency, asset_id: null },
+      usd_micros: micros.toString(),
+      settlement: q.settlement_asset
+        ? { asset_id: q.settlement_asset, amount_base: micros.toString(), par: true }
+        : null,
+      price_snapshot: { primary_usd: "1", secondary_usd: "1", fx: "1.1", par: true, as_of: new Date().toISOString() },
+    } as never;
+  });
+  const settledOn = (accountId: string, lm: boolean, day: string) =>
+    [...executions.values()].filter(
+      (x) =>
+        x.account_id === accountId &&
+        x.livemode === lm &&
+        x.state === "succeeded" &&
+        (x.terminal_at ?? "").slice(0, 10) === day,
+    );
+  rails.on(getEvidenceSummary, async (ctx) => {
+    const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string };
+    const xs = settledOn(q.account_id, q.livemode, q.day);
+    const totals = new Map<string, { kind: string; state: string; asset_id: string; count: number; settled: bigint }>();
+    for (const x of xs) {
+      const asset = x.kind === "refund" ? x.settlement.asset_id : x.settlement.asset_id;
+      const k = `${x.kind}|${asset}`;
+      const t = totals.get(k) ?? { kind: x.kind, state: "succeeded", asset_id: asset, count: 0, settled: 0n };
+      t.count++;
+      t.settled += BigInt(x.settled_amount ?? "0");
+      totals.set(k, t);
+    }
+    return {
+      account_id: q.account_id,
+      livemode: q.livemode,
+      day: q.day,
+      complete: evidenceDay.complete,
+      in_flight: evidenceDay.complete ? 0 : 1,
+      held_open: 0,
+      totals: [...totals.values()].map((t) => ({
+        kind: t.kind,
+        state: t.state,
+        asset_id: t.asset_id,
+        count: t.count,
+        settled_amount: t.settled.toString(),
+        refunded_amount: "0",
+      })),
+      tier_b: { count: 0, explorer_confirmed: 0, unconfirmed: [] },
+      digest: "0".repeat(64),
+      generated_at: new Date().toISOString(),
+    } as never;
+  });
+  rails.on(listEvidence, async (ctx) => {
+    const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string };
+    return { data: settledOn(q.account_id, q.livemode, q.day), has_more: false } as never;
+  });
   rails.on(submitExecutionDepositTx, async () => undefined as never);
   rails.on(signalExecution, async () => undefined as never);
 
@@ -315,14 +500,37 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
   agentpay.on(relaySignedIntent, async () => ({ agent_payment_id: newId("ap") }));
   const compliance = await mockPeer({ service: "compliance", routes: INTERNAL_ROUTES });
   compliance.on(getGeoPolicy, async () => ({ version: "v1", blocked_countries: ["KP"], blocked_regions: ["UA-43"] }));
+  compliance.on(
+    createInternalCase,
+    async (ctx) =>
+      ({
+        id: newId("case"),
+        object: "compliance_case",
+        account_id: ctx.body.account_id,
+        livemode: ctx.body.livemode,
+        kind: "reconciliation_diff",
+        subject: ctx.body.subject,
+        severity: ctx.body.severity ?? "high",
+        status: "open",
+        assignee: null,
+        resolution: null,
+        review: false,
+        created: Math.floor(Date.now() / 1000),
+        closed_at: null,
+      }) as never,
+  );
   const sandbox = await mockPeer({ service: "sandbox", routes: INTERNAL_ROUTES });
   sandbox.on(sandboxSimulateDeposit, async () => undefined as never);
   sandbox.on(sandboxAdvance, async () => undefined as never);
+  sandbox.on(sandboxSimulateIntentsTransfer, async () => ({
+    tx_hash: "4fWvVxqzQRXx9T2N1v1xVYbmbA7m8E3N8kNw8qVvbZNE",
+    block_height: 1,
+  }));
 
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const config: WorkerConfig = {
     env: "test",
-    logLevel: "silent",
+    logLevel: (process.env.NP_TEST_LOG ?? "silent") as never,
     host: "127.0.0.1",
     port: 0,
     metricsPort: 0,
@@ -338,13 +546,22 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     piiKek: randomBytes(32).toString("base64"),
     maxLiveAttempts: 5,
     underpayToleranceMaxBps: 100,
-    pricingCurrencies: ["usd"],
+    pricingCurrencies: ["usd", "eur", "gbp", "chf"],
+    nearRpcUrls: ["http://127.0.0.1:9"],
+    linkSessionsPerIp: 1000,
+    linkSessionsPerLink: 1000,
     turnstileOutageLimit: 5,
     natsUrl: nats?.url ?? "nats://127.0.0.1:9",
     ...(valkey ? { valkeyUrl: valkey.url } : {}),
     ...(o.config as object),
   } as WorkerConfig;
-  const deps: ServiceDeps = { keys: testKeySource(), serviceToken: testServiceToken("payments"), ...o.deps };
+  const deps: ServiceDeps = {
+    keys: testKeySource(),
+    serviceToken: testServiceToken("payments"),
+    // live salts would come from NEAR RPC; tests use a fixed salt for both modes
+    nonces: { fresh: async () => makeNonce("5a0dbe11") },
+    ...o.deps,
+  };
   const { service: api, payments } = createApi(config, {
     ...deps,
     database: createDb<DB>({ url: appUrl, applicationName: "payments-api-test" }),
@@ -396,6 +613,23 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     },
     token: (m, t = {}) =>
       mintTestToken({ sub: newId("key"), acct: m.account, lm: t.livemode ?? false, ptype: "secret_key", scp: [] }),
+    sessionToken: (m, t = {}) =>
+      mintTestToken({
+        sub: newId("usr"),
+        acct: m.account,
+        lm: t.livemode ?? false,
+        ptype: "session",
+        scp: [],
+        role: (t.role ?? "owner") as never,
+        ...(t.stepUp ? { step_up_until: Math.floor(Date.now() / 1000) + 600 } : {}),
+      }),
+    serviceToken: (service) => mintServiceToken(service as never),
+    opsToken: (t = {}) => mintOpsToken({ role: t.role ?? "ops", ...(t.stepUp ? { stepUp: true } : {}) }),
+    failRefundCreates(n, code) {
+      failRefunds = n;
+      failRefundCode = code;
+    },
+    evidenceDay,
     async call(method, path, c = {}) {
       const res = await fetch(`${url}${path}`, {
         method,

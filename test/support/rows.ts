@@ -4,7 +4,8 @@
  */
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { USDC_NEAR } from "@nearpay-internal/testing";
-import type { AttemptRow, IntentRow, SessionRow } from "../../src/app/views.js";
+import type { AttemptRow, IntentRow, LegRow, RefundRow, SessionRow } from "../../src/app/views.js";
+import { signAndSendAction, signIntentAction } from "../../src/domain/refund/next-action.js";
 
 const now = new Date();
 export const intentRow = (o: Partial<IntentRow> = {}): IntentRow => ({
@@ -124,5 +125,107 @@ export const sessionRow = (intent: IntentRow, o: Partial<SessionRow> = {}): Sess
   created_at: now,
   updated_at: now,
   version: 2,
+  ...o,
+});
+
+export const evidence = () => ({
+  chain: "near:mainnet",
+  tx_hash: "4fWvVxqzQRXx9T2N1v1xVYbmbA7m8E3N8kNw8qVvbZNE",
+  block_ref: "123",
+  recipient: "payer.near",
+  asset_id: USDC_NEAR,
+  amount: "99",
+  finality: "final",
+  tier: "A",
+  source: "indexer",
+  observed_at: new Date().toISOString(),
+  explorer_url: "https://nearblocks.io/txns/4fWvVxqzQRXx9T2N1v1xVYbmbA7m8E3N8kNw8qVvbZNE",
+});
+
+export const refundRow = (intent: IntentRow, attempt: AttemptRow, o: Partial<RefundRow> = {}): RefundRow => ({
+  id: uuidv7(),
+  payment_intent_id: intent.id,
+  payment_attempt_id: attempt.id,
+  account_id: intent.account_id,
+  livemode: false,
+  amount: "1000000",
+  budget: "intent",
+  fee_mode: "payer_absorbs",
+  reason: "requested_by_customer",
+  status: "requires_action",
+  method: "route_quote",
+  recipient: attempt.refund_to,
+  recipient_asset_id: attempt.origin_asset_id,
+  recipient_chain: attempt.origin_chain,
+  recipient_type: attempt.refund_type,
+  recipient_overridden: false,
+  source: "api",
+  current_leg_id: null,
+  created_by: "key_x",
+  failure_code: null,
+  succeeded_at: null,
+  canceled_at: null,
+  amount_counted: "0",
+  amount_received: null,
+  evidence: null,
+  extra_amount_sent: "0",
+  idempotency_key: null,
+  metadata: {},
+  created_at: now,
+  updated_at: now,
+  version: 2,
+  ...o,
+});
+
+const deadline = () => new Date(Date.now() + 600_000);
+
+export const signIntentNextAction = () =>
+  signIntentAction(
+    {
+      signer_id: "acme.near",
+      receiver_id: "payer.near",
+      token: USDC_NEAR,
+      amount: "1000000",
+      memo: `np1:${"1".repeat(44)}`,
+      deadline: deadline().toISOString(),
+    },
+    `WgK+EQ${"A".repeat(37)}=`,
+    { symbol: "USDC", decimals: 6 },
+  );
+
+export const legRow = (refund: RefundRow, o: Partial<LegRow> = {}): LegRow => ({
+  id: uuidv7(),
+  refund_id: refund.id,
+  number: 1,
+  method: refund.method,
+  swap_type: "EXACT_INPUT",
+  execution_id: `ex_${"1".repeat(26)}`,
+  execution_version: 1,
+  status: "awaiting_signature",
+  next_action: signAndSendAction({
+    chain: "near:mainnet",
+    chainName: "NEAR",
+    from: "acme.near",
+    to: "0d1c2b3a.near",
+    assetId: USDC_NEAR,
+    token: { standard: "nep141", address: "usdc.near" },
+    symbol: "USDC",
+    decimals: 6,
+    amount: "1000000",
+    memo: null,
+    deadline: deadline().toISOString(),
+  }) as never,
+  deadline: deadline(),
+  amount: "1000000",
+  amount_out_expected: "990000",
+  signed_nonce: null,
+  submitted_tx: null,
+  duplicate: false,
+  evidence: null,
+  failure_code: null,
+  screen: false,
+  created_at: now,
+  updated_at: now,
+  version: 1,
   ...o,
 });

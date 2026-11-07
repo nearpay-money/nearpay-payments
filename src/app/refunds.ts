@@ -1060,7 +1060,7 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
   } catch (e) {
     const u = upstreamCode(e);
     const env = (e as { error?: { message?: string } }).error;
-    if (u.code === "intent_invalid" || u.code === "insufficient_balance")
+    if (u.code === "intent_invalid" || u.code === "insufficient_balance" || u.code === "signed_intent_mismatch")
       throw new ApiError(u.code, { ...(env?.message ? { message: env.message } : {}) });
     throw new ApiError("rail_unavailable", { params: { reason: u.code ?? "relay unreachable" } });
   }

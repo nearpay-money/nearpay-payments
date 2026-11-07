@@ -74,7 +74,7 @@ describe("checkout sessions (merchant)", () => {
   });
 
   it("refuses: unsupported currency, live not enabled, below minimum, unverified cap, embedded without origins", async () => {
-    expect((await session(undefined, { currency: "eur" })).r.body.error.code).toBe("currency_unsupported");
+    expect((await session(undefined, { currency: "sek" })).r.body.error.code).toBe("currency_unsupported");
     const notLive = st.merchant({ liveEnabled: false });
     const r1 = await st.call("POST", "/v1/checkout/sessions", {
       token: await st.token(notLive, { livemode: true }),

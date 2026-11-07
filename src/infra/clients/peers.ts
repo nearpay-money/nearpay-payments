@@ -8,7 +8,7 @@
  * | rails reads (options, minimums, profiles, assets) | 2 s | 1 | yes |
  * | rails deposit tx / signals   | 2 s     | 1 (idempotent) | yes |
  * | identity settlement context  | 1 s     | 1       | yes     |
- * | agentpay `POST /internal/relay` | 5 s  | 0       | yes     |
+ * | agentpay `POST /internal/relay` | 8 s  | 1 (idempotent) | yes |
  * | compliance geo policy        | 1 s     | 1       | yes     |
  * | sandbox (test mode)          | 2 s     | 1       | no      |
  * | rails `POST /internal/refund_executions` | 8 s | 0 (the refund prepare-recovery job retries) | global |
@@ -161,8 +161,9 @@ export function agentpayClient(o: PeerOptions & { baseUrl: string }): Agentpay {
   const c = httpClient({
     target: "agentpay",
     baseUrl: o.baseUrl,
-    timeoutMs: 5_000,
-    attempts: 1,
+    // relay is idempotent on the payload; agentpay's worst case (simulate + queue) is ≈ 5 s
+    timeoutMs: 8_000,
+    attempts: 2,
     breaker: BREAKER,
     serviceToken: o.serviceToken,
     ...(o.fetch ? { fetch: o.fetch } : {}),

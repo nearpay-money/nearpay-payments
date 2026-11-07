@@ -37,7 +37,9 @@ export async function recordOpsAction(
   const id = uuidv7();
   await emit(tx, {
     subject: "evt.payments.ops_action.recorded",
-    aggregate: { type: "ops_action", id, version: 1 },
+    // the outbox keys aggregates by prefixed id and `ops_action` has no prefix: the action uuid goes out as
+    // `aud_…` (same choice as compliance); identity dedupes on `data.object.id` (change request in the report)
+    aggregate: { type: "ops_action", id: fromUuid("aud", id), version: 1 },
     accountId: o.accountUuid,
     livemode: o.livemode,
     data: {

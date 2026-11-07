@@ -6,32 +6,56 @@
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import {
+  BalanceTransaction,
   CheckoutSession,
+  CreatedPaymentIntent,
+  Customer,
   PayerAttempt,
   PaymentIntent,
+  PaymentLink,
   PUBLIC_ROUTES,
   PublicCheckoutSession,
+  Refund,
   streamCheckoutSession,
 } from "@nearpay/spec";
 import { unhandledSubjects } from "@nearpay-internal/bus";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { unimplementedRoutes } from "@nearpay-internal/service";
-import { INTERNAL_ROUTES, SUBJECTS, type Subject } from "@nearpay-internal/spec";
+import { INTERNAL_ROUTES, ReconciliationRun, SUBJECTS, type Subject } from "@nearpay-internal/spec";
 import { USDC_NEAR } from "@nearpay-internal/testing";
 import { describe, expect, it } from "vitest";
 import { paymentsRoutes } from "../../src/api/routes.js";
-import { intentView, payerAttempt, publicSession, sessionView } from "../../src/app/views.js";
+import {
+  customerView,
+  intentView,
+  lineView,
+  linkView,
+  payerAttempt,
+  publicSession,
+  refundView,
+  runView,
+  sessionView,
+} from "../../src/app/views.js";
 import { paymentsHandlers } from "../../src/consumers/handlers.js";
-import { attemptRow, intentRow, sessionRow } from "../support/rows.js";
+import {
+  attemptRow,
+  evidence,
+  intentRow,
+  legRow,
+  refundRow,
+  sessionRow,
+  signIntentNextAction,
+} from "../support/rows.js";
 
 const ALL = [...PUBLIC_ROUTES, ...INTERNAL_ROUTES];
 
 describe("routes and events", () => {
-  it("binds every Stage-1 payments route, and nothing else", () => {
+  it("binds every Stage-1 and Stage-2 payments route (incl. /ops console routes), and nothing else", () => {
     const bindings = paymentsRoutes({} as never);
     expect(unimplementedRoutes("payments", ALL, bindings).map((r) => r.id)).toEqual([]);
     expect(bindings.map((b) => b.route.id).sort()).toEqual(
-      ALL.filter((r) => r.service === "payments" && r.stage <= 1)
+      [...new Map(ALL.map((r) => [r.id, r])).values()]
+        .filter((r) => r.service === "payments" && r.stage <= 2)
         .map((r) => r.id)
         .sort(),
     );
@@ -45,9 +69,9 @@ describe("routes and events", () => {
 
   it("emits every subject payments produces", () => {
     const produced = (Object.keys(SUBJECTS) as Subject[]).filter(
-      (k) => SUBJECTS[k].producer === "payments" && SUBJECTS[k].stage <= 1,
+      (k) => SUBJECTS[k].producer === "payments" && SUBJECTS[k].stage <= 2,
     );
-    expect(produced.length).toBe(10);
+    expect(produced.length).toBe(17);
     const files = (dir: string): string[] =>
       readdirSync(dir).flatMap((f) => (statSync(join(dir, f)).isDirectory() ? files(join(dir, f)) : [join(dir, f)]));
     const src = files(new URL("../../src", import.meta.url).pathname)
@@ -115,5 +139,183 @@ describe("objects", () => {
     const { payment_intent: _, ...pre015 } = pub;
     expect(PublicCheckoutSession.safeParse(pre015).success).toBe(false);
     expect(JSON.stringify(pub)).not.toContain("acme.near");
+  });
+});
+
+// ---- stage 2 objects (spec 0.2.0)
+describe("stage 2 objects", () => {
+  const i = intentRow({ customer_id: uuidv7(), payment_link_id: uuidv7() });
+  const paid = attemptRow(i, { status: "succeeded", settled_amount: "2000042" });
+
+  it("payment intents carry customer, link, refunds, pending refunds, review decision and fingerprint", () => {
+    const refundId = uuidv7();
+    const v = intentView(
+      {
+        ...i,
+        succeeded_attempt_id: paid.id,
+        amount_refund_pending: "100",
+        review_decision: {
+          decision: "reject",
+          decided_at: new Date().toISOString(),
+          refund: refundId,
+          reason: null,
+          actor: "usr_x",
+        },
+        destination_snapshot: { ...i.destination_snapshot, fingerprint: "7KQ2-M9XA-31" },
+      },
+      [paid],
+      uuidv7(),
+      [{ id: refundId, created_at: new Date() }],
+    );
+    const parsed = PaymentIntent.parse(v);
+    expect(parsed).toMatchObject({ amount_refund_pending: "100", refunds: [fromUuid("re", refundId)] });
+    expect(parsed.destination.fingerprint).toBe("7KQ2-M9XA-31");
+    expect(parsed.review_decision?.refund).toBe(fromUuid("re", refundId));
+    expect(
+      CreatedPaymentIntent.safeParse({
+        ...v,
+        checkout_session: fromUuid("cs", uuidv7()),
+        client_secret: `cs_${"0".repeat(26)}_secret_${"a".repeat(32)}`,
+      }).success,
+    ).toBe(true);
+    // Stage 1 snapshots (no fingerprint) stay valid
+    expect(PaymentIntent.safeParse(intentView(intentRow(), [], null)).success).toBe(true);
+  });
+
+  it("refunds (API and every refund event) parse, with next actions of both kinds", () => {
+    const r = refundRow(i, paid);
+    const legs = [legRow(r, { number: 1, status: "expired", next_action: null }), legRow(r, { number: 2 })];
+    const v = refundView(
+      { ...r, current_leg_id: legs[1]?.id as string },
+      legs,
+      { id: USDC_NEAR, decimals: 6 },
+      Date.now(),
+    );
+    expect(Refund.parse(v).next_action?.type).toBe("sign_and_send");
+    expect(v.legs.map((l) => l.number)).toEqual([2, 1]);
+    for (const s of Object.keys(SUBJECTS).filter((k) => k.startsWith("evt.payments.refund.")) as Subject[])
+      expect(SUBJECTS[s].object.safeParse(v).success).toBe(true);
+    const intents = legRow(r, { number: 3, next_action: signIntentNextAction() });
+    const w = refundView(
+      { ...r, current_leg_id: intents.id },
+      [intents, legRow(r, { status: "preparing", deadline: null })],
+      { id: USDC_NEAR, decimals: 6 },
+      Date.now(),
+    );
+    expect(Refund.parse(w).next_action?.type).toBe("sign_intent");
+    expect(w.legs).toHaveLength(1); // a leg being prepared is not shown
+    // past the deadline / not requires_action: no next action
+    expect(
+      refundView(
+        { ...r, status: "pending", current_leg_id: intents.id },
+        [intents],
+        { id: USDC_NEAR, decimals: 6 },
+        Date.now(),
+      ).next_action,
+    ).toBeNull();
+  });
+
+  it("links, customers, statement lines and reconciliation runs parse", () => {
+    const now = new Date();
+    const link = linkView(
+      {
+        id: uuidv7(),
+        account_id: i.account_id,
+        livemode: false,
+        active: true,
+        amount: "500",
+        currency: "usd",
+        pricing_asset_id: null,
+        pricing_asset_amount: null,
+        description: "Tea",
+        settlement_destination_id: null,
+        success_url: null,
+        max_uses: 3,
+        uses: 1,
+        session_expires_in: 3600,
+        collect_email: true,
+        metadata: {},
+        created_at: now,
+        updated_at: now,
+        version: 1,
+      },
+      "https://pay.nearpay.localhost",
+    );
+    expect(PaymentLink.parse(link).url).toBe(`https://pay.nearpay.localhost/l/${link.id}`);
+    const cus = customerView(
+      {
+        id: uuidv7(),
+        account_id: i.account_id,
+        livemode: false,
+        email_hash: null,
+        email_enc: null,
+        name_enc: null,
+        description: null,
+        wallets: [{ chain: "near:mainnet", address: "a.near" }],
+        metadata: {},
+        deleted_at: null,
+        created_at: now,
+        updated_at: now,
+        version: 1,
+      },
+      { email: "ann@example.com", name: "Ann" },
+    );
+    expect(Customer.safeParse(cus).success).toBe(true);
+    const line = lineView({
+      id: uuidv7(),
+      account_id: i.account_id,
+      livemode: false,
+      type: "refund",
+      payment_intent_id: i.id,
+      refund_id: uuidv7(),
+      payment_attempt_id: null,
+      gross_amount: null,
+      gross_currency: null,
+      settled_amount: "100",
+      settlement_asset_id: USDC_NEAR,
+      settlement_decimals: 6,
+      settlement_symbol: "USDC",
+      fee_bps: null,
+      fee_amount_est: null,
+      fee_asset_id: null,
+      evidence: evidence(),
+      refund_leg: 2,
+      received: { amount: "99", asset_id: USDC_NEAR, chain: "near:mainnet" },
+      fee_adjustment: null,
+      execution_id: null,
+      terminal_at: null,
+      created_at: now,
+    });
+    expect(BalanceTransaction.parse(line)).toMatchObject({ refund_leg: 2, received: { amount: "99" } });
+    const run = runView({
+      id: uuidv7(),
+      account_id: i.account_id,
+      livemode: false,
+      day: new Date(2026, 10, 7) as never,
+      status: "diff",
+      trigger: "schedule",
+      rerun_of: null,
+      totals: [],
+      diffs: [
+        {
+          kind: "missing_evidence",
+          asset_id: USDC_NEAR,
+          execution_id: null,
+          balance_transaction: null,
+          payment_intent: null,
+          refund: null,
+          statement_amount: "1",
+          evidence_amount: null,
+          detail: "x",
+        },
+      ],
+      error: null,
+      resolution: null,
+      case_id: null,
+      created_by: "system",
+      started_at: now,
+      completed_at: now,
+    });
+    expect(ReconciliationRun.parse(run)).toMatchObject({ day: "2026-11-07", diff_count: 1 });
   });
 });

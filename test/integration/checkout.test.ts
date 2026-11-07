@@ -74,7 +74,7 @@ describe("checkout sessions (merchant)", () => {
   });
 
   it("refuses: unsupported currency, live not enabled, below minimum, unverified cap, embedded without origins", async () => {
-    expect((await session(undefined, { currency: "eur" })).r.body.error.code).toBe("currency_unsupported");
+    expect((await session(undefined, { currency: "sek" })).r.body.error.code).toBe("currency_unsupported");
     const notLive = st.merchant({ liveEnabled: false });
     const r1 = await st.call("POST", "/v1/checkout/sessions", {
       token: await st.token(notLive, { livemode: true }),
@@ -123,7 +123,11 @@ describe("paying (payer → rails → worker)", () => {
     });
     expect(JSON.stringify(pub.body)).not.toContain("acme.near");
     expect(
-      (await st.call("GET", `/v1/checkout/sessions/${cs}/public`, { secret: `${secret.slice(0, -1)}x` })).status,
+      (
+        await st.call("GET", `/v1/checkout/sessions/${cs}/public`, {
+          secret: `${secret.slice(0, -1)}${secret.endsWith("x") ? "y" : "x"}`,
+        })
+      ).status,
     ).toBe(401);
 
     const opts = await st.call("GET", `/v1/checkout/sessions/${cs}/public/payment_options`, { secret });

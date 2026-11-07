@@ -28,6 +28,15 @@ export interface Applied {
 
 const status = (s: string): AttemptStatus => (isAttemptStatus(s) ? s : "held");
 
+/** `uses += 1` on the intent's payment link (a succeeded payment). */
+export async function countLinkUse(tx: Tx, linkId: string): Promise<void> {
+  await tx
+    .updateTable("payment_links")
+    .set((eb) => ({ uses: eb("uses", "+", 1), version: eb("version", "+", 1), updated_at: new Date() }))
+    .where("id", "=", linkId)
+    .execute();
+}
+
 export async function applyAttemptChange(
   p: Payments,
   tx: Tx,
@@ -37,6 +46,8 @@ export async function applyAttemptChange(
     before: AttemptRow;
     after: AttemptRow;
     others: readonly AttemptRow[];
+    /** The execution behind the change, when there is one (statement lines record its terminal time). */
+    terminalAt?: string | null;
   },
   meta: Meta,
 ): Promise<Applied> {
@@ -141,10 +152,15 @@ export async function applyAttemptChange(
         fee_amount_est: line.feeAmountEst,
         fee_asset_id: line.feeAssetId,
         evidence: JSON.stringify(attempt.evidence ?? {}),
+        execution_id: attempt.execution_id,
+        terminal_at: o.terminalAt ? new Date(o.terminalAt) : null,
       })
       .onConflict((oc) => oc.doNothing())
       .execute();
   }
+
+  // a payment link counts succeeded payments (§17 item 11)
+  if (decision.intent?.succeeded && intent.payment_link_id) await countLinkUse(tx, intent.payment_link_id);
 
   if (decision.intentEvents.length) intent = await emitIntentEvents(tx, intent, decision.intentEvents, previous);
   if (session && decision.sessionEvents.length) await emitSessionEvents(tx, session, intent, decision.sessionEvents);

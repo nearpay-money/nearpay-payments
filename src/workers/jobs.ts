@@ -6,11 +6,24 @@
  * | session.expire           | at the session's `expires_at`           | open → expiring / expired (INV-3)  |
  * | attempt.quoting_recovery | every 15 s                              | re-ask rails for attempts stuck in `quoting` > 20 s; fail after 2 min |
  * | context.refresh          | on identity events; sweep every 5 min   | refresh settlement contexts (backstop to events) |
+ * | refund.prepare_recovery  | every 15 s                              | re-ask rails for refund legs stuck in `preparing` > 20 s; fail after 2 min |
+ * | reconcile.daily          | 02:00 UTC                               | one reconcile.run per account/mode with activity yesterday |
+ * | reconcile.run            | per account day, or per ops run         | statement vs rails evidence → append-only run |
+ * | reconcile.case           | after a diff/error run                  | open the compliance `reconciliation_diff` case |
  * | kit.purge                | hourly                                  | published outbox, old inbox, expired idempotency keys |
  */
 import { type JobHandler, purgeKitTables, type RecurringJob } from "@nearpay-internal/db";
 import { QUOTING_RECOVER_AFTER_MS, recoverQuoting } from "../app/attempts.js";
 import type { Payments } from "../app/context.js";
+import {
+  openCase,
+  RECONCILE_CASE_JOB,
+  RECONCILE_DAILY_JOB,
+  RECONCILE_RUN_JOB,
+  runJob,
+  scheduleDaily,
+} from "../app/reconciliation.js";
+import { PREPARE_RECOVER_AFTER_MS, PREPARE_RECOVERY_JOB, recoverPreparing } from "../app/refunds.js";
 import { expireAtDeadline, SESSION_EXPIRE_JOB } from "../app/sessions.js";
 import { refreshContext } from "../app/settlement-context.js";
 import { CONTEXT_REFRESH_JOB } from "../consumers/handlers.js";
@@ -25,6 +38,8 @@ const CONTEXT_MAX_AGE_MS = 5 * 60_000;
 export const RECURRING: readonly RecurringJob[] = [
   { kind: QUOTING_RECOVERY_JOB, everyMs: 15_000 },
   { kind: CONTEXT_SWEEP_JOB, everyMs: 5 * 60_000 },
+  { kind: PREPARE_RECOVERY_JOB, everyMs: 15_000 },
+  { kind: RECONCILE_DAILY_JOB, everyMs: 24 * HOUR, offsetMs: 2 * HOUR },
   { kind: "kit.purge", everyMs: HOUR },
 ];
 
@@ -100,6 +115,39 @@ export function jobHandlers(p: Payments): Record<string, JobHandler> {
           );
         }
       }
+    },
+
+    [PREPARE_RECOVERY_JOB]: async () => {
+      const stuck = await p.db
+        .selectFrom("refund_legs")
+        .select("id")
+        .where("status", "=", "preparing")
+        .where("created_at", "<", new Date(p.now() - PREPARE_RECOVER_AFTER_MS))
+        .orderBy("created_at", "asc")
+        .limit(50)
+        .execute();
+      for (const l of stuck) {
+        try {
+          await recoverPreparing(p, l.id);
+        } catch (e) {
+          p.log.warn({ leg: l.id, err: e instanceof Error ? e.message : String(e) }, "refund leg recovery failed");
+        }
+      }
+    },
+
+    [RECONCILE_DAILY_JOB]: async () => {
+      p.log.info({ scheduled: await scheduleDaily(p) }, "daily reconciliation scheduled");
+    },
+
+    [RECONCILE_RUN_JOB]: async (payload, ctx) => {
+      await ctx.extendLease(300);
+      await runJob(p, payload, ctx.attempt);
+    },
+
+    [RECONCILE_CASE_JOB]: async (payload) => {
+      const run = (payload as { run?: unknown } | null)?.run;
+      if (typeof run !== "string") throw new Error("reconcile.case payload without a run");
+      await openCase(p, run);
     },
 
     "kit.purge": async () => {

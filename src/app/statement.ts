@@ -11,6 +11,8 @@ import { type LineRow, lineView } from "./views.js";
 export interface LineQuery extends PageQuery {
   readonly payment_intent?: string | undefined;
   readonly type?: string | undefined;
+  /** Stage 2: lines of one refund. */
+  readonly refund?: string | undefined;
 }
 
 export async function listLines(p: Payments, m: Merchant, q: LineQuery) {
@@ -21,6 +23,7 @@ export async function listLines(p: Payments, m: Merchant, q: LineQuery) {
     .where("livemode", "=", m.livemode);
   if (q.payment_intent) base = base.where("payment_intent_id", "=", toUuid(q.payment_intent, "pi"));
   if (q.type) base = base.where("type", "=", q.type as LineRow["type"]);
+  if (q.refund) base = base.where("refund_id", "=", toUuid(q.refund, "re"));
   const page = await pageOf(base, q, "txn");
   return {
     object: "list" as const,

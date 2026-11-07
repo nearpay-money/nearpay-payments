@@ -159,16 +159,17 @@ export async function emitIntentEvents(
   let cur = row;
   for (const [k, subject] of subjects.entries()) {
     if (k > 0) cur = await touchIntent(tx, cur);
-    const [attempts, session] = await Promise.all([
+    const [attempts, session, refunds] = await Promise.all([
       attemptsOf(tx, cur.id),
       tx.selectFrom("checkout_sessions").select("id").where("payment_intent_id", "=", cur.id).executeTakeFirst(),
+      tx.selectFrom("refunds").select(["id", "created_at"]).where("payment_intent_id", "=", cur.id).execute(),
     ]);
     await emit(tx, {
       subject,
       aggregate: { type: "payment_intent", id: fromUuid("pi", cur.id), version: Math.max(1, cur.version) },
       accountId: cur.account_id,
       livemode: cur.livemode,
-      data: { object: intentView(cur, attempts, session?.id ?? null), ...(previous ? { previous } : {}) },
+      data: { object: intentView(cur, attempts, session?.id ?? null, refunds), ...(previous ? { previous } : {}) },
     });
   }
   return cur;

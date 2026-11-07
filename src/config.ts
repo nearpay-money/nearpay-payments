@@ -32,7 +32,13 @@ const shared = {
   turnstileBaseUrl: url(["https:", "http:"]).optional(),
   maxLiveAttempts: bounded(1, 50, 5),
   underpayToleranceMaxBps: bounded(0, 10_000, 100),
-  pricingCurrencies: list(z.string().regex(/^[a-z]{3}$/)).default(["usd"]),
+  /** Fiat pricing currencies payments accepts (Stage 2: rails' FX rates decide availability, ADR-0020 d5). */
+  pricingCurrencies: list(z.string().regex(/^[a-z]{3}$/)).default(["usd", "eur", "gbp", "chf", "jpy", "cad", "aud"]),
+  /** NEAR RPC endpoints for the Verifier's `current_salt` (live refund legs signed from an Intents account). */
+  nearRpcUrls: list(http()).default(["https://free.rpc.fastnear.com"]),
+  /** Anonymous payment-link sessions per IP per minute, and per link per minute (§6.2). */
+  linkSessionsPerIp: bounded(1, 1_000, 10),
+  linkSessionsPerLink: bounded(1, 10_000, 60),
   /** Payer attempts per IP per 10 minutes while Turnstile is unavailable (F-12). */
   turnstileOutageLimit: bounded(1, 1_000, 5),
 };

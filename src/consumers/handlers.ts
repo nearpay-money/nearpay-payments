@@ -11,6 +11,9 @@
  * | evt.identity.settlement_destination.*           | that mode's context → stale + refresh job         |
  * | evt.compliance.review.{opened,closed}           | intent `compliance_review` (no state change; the payment stands, INV-1) |
  * | evt.compliance.policy.updated                   | cached geo policy                                 |
+ * | evt.sentinel.kill_switch.{engaged,released}     | local kill-switch flag (version-checked): no new live refund legs or relays while engaged |
+ *
+ * Refund-leg executions (`kind: refund`) arrive on the same rails subjects and are applied to their leg.
  */
 import type { Envelope, EventHandler } from "@nearpay-internal/bus";
 import { deadLetterSink, enqueueJob, inboxHandler, type Kysely } from "@nearpay-internal/db";
@@ -19,6 +22,7 @@ import { Execution, type Subject } from "@nearpay-internal/spec";
 import type { Payments, Tx } from "../app/context.js";
 import { applyExecutionEvent } from "../app/executions.js";
 import { storePolicy } from "../app/geo.js";
+import { storeKillSwitch } from "../app/kill-switch.js";
 import { lockIntent, updateIntent } from "../app/ledger.js";
 import { markStale } from "../app/settlement-context.js";
 import type { DB } from "../infra/db/schema.js";
@@ -116,6 +120,21 @@ export function paymentsHandlers(p: Payments, db: Kysely<DB> = p.db): Partial<Re
     const pol = e.data.object as unknown as { version: string; blocked_countries: string[]; blocked_regions: string[] };
     await storePolicy(tx, pol);
   });
+  const killSwitch = h(async (tx, e) => {
+    const k = e.data.object as unknown as { engaged: boolean; reason: string };
+    const applied = await storeKillSwitch(tx, {
+      engaged: k.engaged,
+      version: e.aggregate.version,
+      reason: k.reason ?? null,
+    });
+    if (applied)
+      p.log.warn(
+        { engaged: k.engaged, version: e.aggregate.version },
+        "kill switch changed: live refund legs and relays follow it",
+      );
+  });
+  handlers["evt.sentinel.kill_switch.engaged"] = killSwitch;
+  handlers["evt.sentinel.kill_switch.released"] = killSwitch;
   return handlers;
 }
 

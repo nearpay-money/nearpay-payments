@@ -4,7 +4,7 @@
  * - `worker`  consumers (rails, identity, compliance), jobs (session expiry, quoting recovery,
  *             context refresh, purge) and the outbox relay
  */
-import { createPrivateKey, type KeyObject } from "node:crypto";
+import { createHmac, createPrivateKey, type KeyObject } from "node:crypto";
 import { hostname } from "node:os";
 import type { KeySource } from "@nearpay-internal/auth";
 import { serviceTokenClient } from "@nearpay-internal/auth";
@@ -39,6 +39,7 @@ import { STREAMS, type Subject } from "@nearpay-internal/spec";
 import { paymentsRoutes } from "../api/routes.js";
 import type { ApiConfig, SharedConfig, WorkerConfig } from "../config.js";
 import { deadLetters, paymentsHandlers } from "../consumers/handlers.js";
+import { type Nonces, verifierNonces } from "../infra/clients/near.js";
 import {
   type Agentpay,
   agentpayClient,
@@ -71,6 +72,7 @@ export interface ServiceDeps {
   notifier?: Notifier;
   ticketKey?: KeyObject;
   cipher?: EnvelopeCipher;
+  nonces?: Nonces;
   fetch?: typeof fetch;
   random?: () => number;
   now?: () => number;
@@ -124,12 +126,17 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     notifier: deps.notifier ?? notifier(config.valkeyUrl),
     ticketKey: deps.ticketKey ?? createPrivateKey(config.ticketSigningKey),
     cipher: deps.cipher ?? createEnvelopeCipher(parseKek(config.piiKek)),
+    // a separate key for the email lookup hash, derived from the KEK (never the KEK itself)
+    emailHashKey: createHmac("sha256", parseKek(config.piiKek)).update("nearpay:payments:customer-email:v1").digest(),
+    nonces: deps.nonces ?? verifierNonces({ rpcUrls: config.nearRpcUrls, ...f }),
     settings: {
       payOrigin: config.payOrigin.replace(/\/$/, ""),
       maxLiveAttempts: config.maxLiveAttempts,
       underpayToleranceMaxBps: config.underpayToleranceMaxBps,
       pricingCurrencies: new Set(config.pricingCurrencies),
       turnstileOutageLimit: config.turnstileOutageLimit,
+      linkSessionsPerIp: config.linkSessionsPerIp,
+      linkSessionsPerLink: config.linkSessionsPerLink,
     },
     caches: newCaches(deps.now),
     random: deps.random ?? Math.random,

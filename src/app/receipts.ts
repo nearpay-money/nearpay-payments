@@ -6,18 +6,15 @@ import { toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Payments } from "./context.js";
 import { merchantName } from "./payer.js";
+import { receiptEmail } from "./refunds.js";
 import { settlementContext } from "./settlement-context.js";
 import { pricingOf, settlementValue } from "./views.js";
 
 export async function receiptContext(p: Payments, id: string) {
   const i = await p.db.selectFrom("payment_intents").selectAll().where("id", "=", toUuid(id, "pi")).executeTakeFirst();
   if (!i) throw ApiError.missing("payment_intent", id);
-  const [s, paid, ctx] = await Promise.all([
-    p.db
-      .selectFrom("checkout_sessions")
-      .select(["id", "customer_email_enc"])
-      .where("payment_intent_id", "=", i.id)
-      .executeTakeFirst(),
+  const [email, paid, ctx] = await Promise.all([
+    receiptEmail(p, i),
     i.succeeded_attempt_id
       ? p.db
           .selectFrom("payment_attempts")
@@ -27,7 +24,6 @@ export async function receiptContext(p: Payments, id: string) {
       : undefined,
     settlementContext(p, i.account_id, i.livemode),
   ]);
-  const email = s?.customer_email_enc ? p.cipher.decrypt(s.customer_email_enc, `cs:${s.id}`).toString("utf8") : null;
   const url = (paid?.evidence as { explorer_url?: string | null } | null)?.explorer_url ?? null;
   const pricing = pricingOf(i);
   return {

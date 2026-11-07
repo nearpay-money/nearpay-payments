@@ -8,27 +8,38 @@
  * | rails reads (options, minimums, profiles, assets) | 2 s | 1 | yes |
  * | rails deposit tx / signals   | 2 s     | 1 (idempotent) | yes |
  * | identity settlement context  | 1 s     | 1       | yes     |
- * | agentpay `POST /internal/relay` | 5 s  | 0       | yes     |
+ * | agentpay `POST /internal/relay` | 8 s  | 1 (idempotent) | yes |
  * | compliance geo policy        | 1 s     | 1       | yes     |
  * | sandbox (test mode)          | 2 s     | 1       | no      |
+ * | rails `POST /internal/refund_executions` | 8 s | 0 (the refund prepare-recovery job retries) | global |
+ * | rails FX rates / settlement estimate | 2 s | 1  | yes     |
+ * | rails evidence (reconciliation) | 10 s | 1      | no      |
+ * | compliance `POST /internal/cases` | 3 s | 0 (the case job retries, idempotent) | yes |
  */
 
 import type { RouteBody, RouteQuery, RouteResponse } from "@nearpay/spec";
 import { HttpError, httpClient, TimeoutError } from "@nearpay-internal/http";
 import {
   createExecution,
+  createInternalCase,
+  createRefundExecution,
   type Execution,
+  estimateSettlement,
   getDestinationMinimums,
+  getEvidenceSummary,
   getExecution,
   getGeoPolicy,
   getInternalAsset,
   getSettlementContext,
   listChainProfiles,
+  listEvidence,
+  listFxRates,
   listInternalOptions,
   relaySignedIntent,
   type SettlementContext,
   sandboxAdvance,
   sandboxSimulateDeposit,
+  sandboxSimulateIntentsTransfer,
   signalExecution,
   submitExecutionDepositTx,
 } from "@nearpay-internal/spec";
@@ -51,6 +62,12 @@ export type CreateExecutionBody = RouteBody<typeof createExecution>;
 export type InternalAsset = RouteResponse<typeof getInternalAsset>;
 export type ChainProfile = RouteResponse<typeof listChainProfiles>["profiles"][number];
 export type InternalOption = RouteResponse<typeof listInternalOptions>["options"][number];
+export type CreateRefundExecutionBody = RouteBody<typeof createRefundExecution>;
+export type FxRatesResponse = RouteResponse<typeof listFxRates>;
+export type SettlementEstimateResponse = RouteResponse<typeof estimateSettlement>;
+export type EvidenceSummaryResponse = RouteResponse<typeof getEvidenceSummary>;
+export type EvidencePage = RouteResponse<typeof listEvidence>;
+export type CreateCaseBody = RouteBody<typeof createInternalCase>;
 
 export interface Rails {
   createExecution(body: CreateExecutionBody): Promise<Execution>;
@@ -61,6 +78,12 @@ export interface Rails {
   asset(assetId: string, livemode: boolean): Promise<InternalAsset>;
   submitDepositTx(executionId: string, txHash: string): Promise<void>;
   signal(executionId: string): Promise<void>;
+  // stage 2
+  createRefundExecution(body: CreateRefundExecutionBody): Promise<Execution>;
+  fxRates(livemode: boolean, currencies: readonly string[]): Promise<FxRatesResponse>;
+  estimate(q: RouteQuery<typeof estimateSettlement>): Promise<SettlementEstimateResponse>;
+  evidenceSummary(accountId: string, livemode: boolean, day: string): Promise<EvidenceSummaryResponse>;
+  evidence(q: RouteQuery<typeof listEvidence>): Promise<EvidencePage>;
 }
 
 export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
@@ -72,6 +95,8 @@ export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
   };
   const write = httpClient({ ...common, timeoutMs: 8_000, attempts: 1, breaker: BREAKER });
   const read = httpClient({ ...common, timeoutMs: 2_000, attempts: 2, breaker: BREAKER });
+  // reconciliation reads pages of a whole day: a longer timeout, no breaker shared with checkout reads
+  const reconcileRead = httpClient({ ...common, timeoutMs: 10_000, attempts: 2, breaker: false });
   return {
     createExecution: (body) => write.call(createExecution, { body }),
     getExecution: (id) => read.call(getExecution, { params: { id } }),
@@ -94,6 +119,17 @@ export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
         idempotencyKey: `signal:${id}:${Date.now()}`,
       });
     },
+    createRefundExecution: (body) => write.call(createRefundExecution, { body, idempotencyKey: body.idempotency_key }),
+    fxRates: (livemode, currencies) =>
+      read.call(listFxRates, {
+        query: { livemode: livemode ? "true" : "false", currencies: currencies.join(",") } as never,
+      }),
+    estimate: (q) => read.call(estimateSettlement, { query: q as never }),
+    evidenceSummary: (accountId, livemode, day) =>
+      reconcileRead.call(getEvidenceSummary, {
+        query: { account_id: accountId, livemode: livemode ? "true" : "false", day } as never,
+      }),
+    evidence: (q) => reconcileRead.call(listEvidence, { query: q as never }),
   };
 }
 
@@ -125,8 +161,9 @@ export function agentpayClient(o: PeerOptions & { baseUrl: string }): Agentpay {
   const c = httpClient({
     target: "agentpay",
     baseUrl: o.baseUrl,
-    timeoutMs: 5_000,
-    attempts: 1,
+    // relay is idempotent on the payload; agentpay's worst case (simulate + queue) is ≈ 5 s
+    timeoutMs: 8_000,
+    attempts: 2,
     breaker: BREAKER,
     serviceToken: o.serviceToken,
     ...(o.fetch ? { fetch: o.fetch } : {}),
@@ -136,6 +173,8 @@ export function agentpayClient(o: PeerOptions & { baseUrl: string }): Agentpay {
 
 export interface Compliance {
   geoPolicy(): Promise<RouteResponse<typeof getGeoPolicy>>;
+  /** Opens a `reconciliation_diff` case (idempotent on `rcn:<run id>`). */
+  createCase(body: CreateCaseBody, idempotencyKey: string): Promise<{ id: string }>;
 }
 
 export function complianceClient(o: PeerOptions & { baseUrl: string }): Compliance {
@@ -148,12 +187,28 @@ export function complianceClient(o: PeerOptions & { baseUrl: string }): Complian
     serviceToken: o.serviceToken,
     ...(o.fetch ? { fetch: o.fetch } : {}),
   });
-  return { geoPolicy: () => c.call(getGeoPolicy) };
+  const write = httpClient({
+    target: "compliance",
+    baseUrl: o.baseUrl,
+    timeoutMs: 3_000,
+    attempts: 1,
+    breaker: BREAKER,
+    serviceToken: o.serviceToken,
+    ...(o.fetch ? { fetch: o.fetch } : {}),
+  });
+  return {
+    geoPolicy: () => c.call(getGeoPolicy),
+    createCase: async (body, key) => {
+      const r = await write.call(createInternalCase, { body, idempotencyKey: key });
+      return { id: r.id };
+    },
+  };
 }
 
 export interface Sandbox {
   simulateDeposit(body: RouteBody<typeof sandboxSimulateDeposit>): Promise<void>;
   advance(body: RouteBody<typeof sandboxAdvance>): Promise<void>;
+  simulateIntentsTransfer(body: RouteBody<typeof sandboxSimulateIntentsTransfer>): Promise<void>;
 }
 
 export function sandboxClient(o: PeerOptions & { baseUrl: string }): Sandbox {
@@ -172,6 +227,9 @@ export function sandboxClient(o: PeerOptions & { baseUrl: string }): Sandbox {
     },
     advance: async (body) => {
       await c.call(sandboxAdvance, { body });
+    },
+    simulateIntentsTransfer: async (body) => {
+      await c.call(sandboxSimulateIntentsTransfer, { body });
     },
   };
 }

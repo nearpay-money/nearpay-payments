@@ -107,7 +107,13 @@ export async function runJob(p: Payments, payload: unknown, attempt: number): Pr
   // rails has not closed the day yet: retry later (backoff) rather than record a spurious diff
   if (!summary.complete) throw new Error(`evidence of ${o.day} not complete yet (in_flight ${summary.in_flight})`);
   const run = await p.db.transaction().execute((tx) =>
-    insertRun(tx, { account: o.account as string, livemode: o.livemode as boolean, day: o.day as string, trigger: "schedule", createdBy: "system" }),
+    insertRun(tx, {
+      account: o.account as string,
+      livemode: o.livemode as boolean,
+      day: o.day as string,
+      trigger: "schedule",
+      createdBy: "system",
+    }),
   );
   await executeRun(p, run.id, RUN_ATTEMPTS_BEFORE_ERROR, summary);
 }
@@ -142,14 +148,20 @@ async function statementOf(p: Payments, account: string, livemode: boolean, day:
     .where(sql<boolean>`coalesce(terminal_at, created_at) >= ${start} and coalesce(terminal_at, created_at) < ${end}`)
     .execute();
   // Stage 1 lines carry no execution id: link them through their attempt / refund leg
-  const attemptIds = rows.filter((r) => !r.execution_id && r.payment_attempt_id).map((r) => r.payment_attempt_id as string);
+  const attemptIds = rows
+    .filter((r) => !r.execution_id && r.payment_attempt_id)
+    .map((r) => r.payment_attempt_id as string);
   const refundIds = rows.filter((r) => !r.execution_id && r.refund_id).map((r) => r.refund_id as string);
   const [attempts, legs] = await Promise.all([
     attemptIds.length
       ? p.db.selectFrom("payment_attempts").select(["id", "execution_id"]).where("id", "in", attemptIds).execute()
       : [],
     refundIds.length
-      ? p.db.selectFrom("refund_legs").select(["refund_id", "number", "execution_id"]).where("refund_id", "in", refundIds).execute()
+      ? p.db
+          .selectFrom("refund_legs")
+          .select(["refund_id", "number", "execution_id"])
+          .where("refund_id", "in", refundIds)
+          .execute()
       : [],
   ]);
   const exOfAttempt = new Map(attempts.map((a) => [a.id, a.execution_id]));
@@ -349,7 +361,11 @@ export async function listRuns(p: Payments, q: RunListQuery) {
 }
 
 async function runRow(p: Payments, id: string): Promise<RunRow> {
-  const r = await p.db.selectFrom("reconciliation_runs").selectAll().where("id", "=", toUuid(id, "rcn")).executeTakeFirst();
+  const r = await p.db
+    .selectFrom("reconciliation_runs")
+    .selectAll()
+    .where("id", "=", toUuid(id, "rcn"))
+    .executeTakeFirst();
   if (!r) throw ApiError.missing("reconciliation_run", id);
   return r;
 }
@@ -370,7 +386,13 @@ export async function createRun(
   let run: RunRow;
   try {
     run = await p.db.transaction().execute(async (tx) => {
-      const r = await insertRun(tx, { account, livemode: body.livemode, day: body.day, trigger: "ops", createdBy: op.sub });
+      const r = await insertRun(tx, {
+        account,
+        livemode: body.livemode,
+        day: body.day,
+        trigger: "ops",
+        createdBy: op.sub,
+      });
       await enqueueJob(tx, {
         kind: RECONCILE_RUN_JOB,
         payload: { run: r.id },

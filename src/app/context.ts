@@ -2,6 +2,7 @@
 import type { KeyObject } from "node:crypto";
 import type { EnvelopeCipher, Kysely, Transaction } from "@nearpay-internal/db";
 import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
+import type { Nonces } from "../infra/clients/near.js";
 import type {
   Agentpay,
   ChainProfile,
@@ -11,7 +12,6 @@ import type {
   Rails,
   Sandbox,
 } from "../infra/clients/peers.js";
-import type { Nonces } from "../infra/clients/near.js";
 import type { Turnstile } from "../infra/clients/turnstile.js";
 import type { DB } from "../infra/db/schema.js";
 import type { Notifier } from "../infra/notifier.js";

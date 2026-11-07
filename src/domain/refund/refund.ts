@@ -92,7 +92,8 @@ export function budgetOf(
   attempt: { readonly id: string; readonly status: string; readonly settled: bigint | null },
 ): "intent" | "attempt" | CreateError {
   if (attempt.status !== "succeeded" || attempt.settled === null || attempt.settled <= 0n) return "attempt_not_settled";
-  if (attempt.id === intent.succeededAttemptId) return intent.status === "succeeded" ? "intent" : "intent_not_succeeded";
+  if (attempt.id === intent.succeededAttemptId)
+    return intent.status === "succeeded" ? "intent" : "intent_not_succeeded";
   return "attempt";
 }
 
@@ -258,7 +259,12 @@ export function prepareMode(
   if (!current) return "new_leg";
   if (current.status === "preparing") return "retry";
   if (current.status === "expired" || current.status === "failed" || current.status === "returned") return "new_leg";
-  if (current.status === "awaiting_signature" && !current.submittedTx && current.deadline && current.deadline.getTime() <= now)
+  if (
+    current.status === "awaiting_signature" &&
+    !current.submittedTx &&
+    current.deadline &&
+    current.deadline.getTime() <= now
+  )
     return "new_leg";
   return "state_conflict";
 }

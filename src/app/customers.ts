@@ -87,7 +87,12 @@ export async function listCustomers(p: Payments, m: Merchant, q: PageQuery & { e
     .where("deleted_at", "is", null);
   if (q.email) base = base.where("email_hash", "=", emailHash(p, q.email));
   const page = await pageOf(base, q, "cus");
-  return { object: "list" as const, data: page.rows.map((c) => view(p, c)), has_more: page.hasMore, url: "/v1/customers" };
+  return {
+    object: "list" as const,
+    data: page.rows.map((c) => view(p, c)),
+    has_more: page.hasMore,
+    url: "/v1/customers",
+  };
 }
 
 /** `PATCH /v1/customers/{id}` (`null` clears a field; `wallets` replaces the list). */
@@ -100,7 +105,8 @@ export async function updateCustomer(p: Payments, m: Merchant, id: string, body:
     patch.email_hash = email ? emailHash(p, email) : null;
     patch.email_enc = email ? p.cipher.encrypt(email, aad(c.id, "email")) : null;
   }
-  if (body.name !== undefined) patch.name_enc = body.name === null ? null : p.cipher.encrypt(body.name, aad(c.id, "name"));
+  if (body.name !== undefined)
+    patch.name_enc = body.name === null ? null : p.cipher.encrypt(body.name, aad(c.id, "name"));
   if (body.description !== undefined) patch.description = body.description;
   if (body.wallets !== undefined) patch.wallets = JSON.stringify(dedupeWallets(body.wallets));
   if (body.metadata !== undefined) patch.metadata = JSON.stringify(body.metadata);

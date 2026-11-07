@@ -50,8 +50,8 @@ import {
   reserve,
   swapTypeOf,
 } from "../domain/refund/refund.js";
-import type { RefundLegsTable, RefundsTable } from "../infra/db/schema.js";
 import { upstreamCode } from "../infra/clients/peers.js";
+import type { RefundLegsTable, RefundsTable } from "../infra/db/schema.js";
 import type { Payments, Tx } from "./context.js";
 import { assertRefundsAllowed, killSwitchEngaged } from "./kill-switch.js";
 import { lockIntent, type Meta, updateAttempt, updateIntent } from "./ledger.js";
@@ -105,7 +105,12 @@ async function lockAll(tx: Tx, refundId: string): Promise<Locked | null> {
     .where("id", "=", head.payment_attempt_id)
     .forUpdate()
     .executeTakeFirstOrThrow();
-  const refund = await tx.selectFrom("refunds").selectAll().where("id", "=", refundId).forUpdate().executeTakeFirstOrThrow();
+  const refund = await tx
+    .selectFrom("refunds")
+    .selectAll()
+    .where("id", "=", refundId)
+    .forUpdate()
+    .executeTakeFirstOrThrow();
   const legs = await tx
     .selectFrom("refund_legs")
     .selectAll()
@@ -158,12 +163,7 @@ async function writeBudget(
   return { ...l, attempt };
 }
 
-async function updateRefund(
-  tx: Tx,
-  cur: RefundRow,
-  patch: Updateable<RefundsTable>,
-  meta: Meta,
-): Promise<RefundRow> {
+async function updateRefund(tx: Tx, cur: RefundRow, patch: Updateable<RefundsTable>, meta: Meta): Promise<RefundRow> {
   const next = await tx
     .updateTable("refunds")
     .set({ ...patch, version: cur.version + 1, updated_at: new Date() })
@@ -306,7 +306,12 @@ async function viewsOf(p: Payments, rows: readonly RefundRow[]) {
   for (const l of legs) byRefund.set(l.refund_id, [...(byRefund.get(l.refund_id) ?? []), l]);
   const asset = new Map(intents.map((i) => [i.id, { id: i.settlement_asset_id, decimals: i.settlement_decimals }]));
   return rows.map((r) =>
-    refundView(r, byRefund.get(r.id) ?? [], asset.get(r.payment_intent_id) as { id: string; decimals: number }, p.now()),
+    refundView(
+      r,
+      byRefund.get(r.id) ?? [],
+      asset.get(r.payment_intent_id) as { id: string; decimals: number },
+      p.now(),
+    ),
   );
 }
 
@@ -485,23 +490,30 @@ export async function createRefund(
         },
       );
       if (kind === "intent_not_succeeded")
-        throw new ApiError(kind, { message: `The payment intent is ${intent.status}; only a succeeded intent is refunded.` });
+        throw new ApiError(kind, {
+          message: `The payment intent is ${intent.status}; only a succeeded intent is refunded.`,
+        });
       if (kind === "attempt_not_settled")
         throw new ApiError(kind, {
           param: "payment_attempt",
           message: `Attempt ${fromUuid("pa", attempt.id)} is ${attempt.status}; nothing verified settled through it.`,
         });
       const amount = body.amount !== undefined ? BigInt(body.amount) : refundable(budgetFrom(kind, intent, attempt));
-      return insertRefund(p, tx, { intent, attempt }, {
-        kind,
-        amount,
-        feeMode: body.fee_mode,
-        reason: body.reason ?? null,
-        source: actor.source,
-        actor: actor.id,
-        idempotencyKey: key,
-        metadata: body.metadata ?? {},
-      });
+      return insertRefund(
+        p,
+        tx,
+        { intent, attempt },
+        {
+          kind,
+          amount,
+          feeMode: body.fee_mode,
+          reason: body.reason ?? null,
+          source: actor.source,
+          actor: actor.id,
+          idempotencyKey: key,
+          metadata: body.metadata ?? {},
+        },
+      );
     });
   } catch (e) {
     // a concurrent create with the same key won the unique index: answer with its refund
@@ -560,7 +572,8 @@ async function callRails(p: Payments, refundId: string, legId: string): Promise<
     return { kind: "ok", x };
   } catch (e) {
     const u = upstreamCode(e);
-    if (isTransientRailError(u.code)) return { kind: "transient", reason: u.code ?? (u.timeout ? "timeout" : "unreachable") };
+    if (isTransientRailError(u.code))
+      return { kind: "transient", reason: u.code ?? (u.timeout ? "timeout" : "unreachable") };
     const env = (e as { error?: { message?: string; param?: string } }).error;
     return {
       kind: "definitive",
@@ -606,7 +619,11 @@ async function nextActionOf(p: Payments, r: RefundRow, i: IntentRow, x: Executio
  * execution event instead.
  */
 async function linkLeg(p: Payments, legId: string, x: Execution, actor: string): Promise<void> {
-  const head = await p.db.selectFrom("refund_legs").select(["refund_id"]).where("id", "=", legId).executeTakeFirstOrThrow();
+  const head = await p.db
+    .selectFrom("refund_legs")
+    .select(["refund_id"])
+    .where("id", "=", legId)
+    .executeTakeFirstOrThrow();
   const r0 = await p.db.selectFrom("refunds").selectAll().where("id", "=", head.refund_id).executeTakeFirstOrThrow();
   const i0 = await p.db
     .selectFrom("payment_intents")
@@ -647,7 +664,15 @@ async function linkLeg(p: Payments, legId: string, x: Execution, actor: string):
       return;
     }
     // the execution already moved on (e.g. a retried create after a deposit): apply it as an event
-    await applyLegChange(p, tx, { ...l, legs: l.legs.map((g) => (g.id === legId ? linked : g)) }, leg, linked, x, actor);
+    await applyLegChange(
+      p,
+      tx,
+      { ...l, legs: l.legs.map((g) => (g.id === legId ? linked : g)) },
+      leg,
+      linked,
+      x,
+      actor,
+    );
   });
 }
 
@@ -658,11 +683,24 @@ async function failPreparation(p: Payments, refundId: string, legId: string, cod
     if (!l) return;
     const leg = l.legs.find((g) => g.id === legId) as LegRow;
     if (leg.status !== "preparing") return;
-    const failed = await updateLeg(tx, leg, { status: "failed", failure_code: code.slice(0, 64) }, {
-      cause: `preparation failed: ${code}`,
+    const failed = await updateLeg(
+      tx,
+      leg,
+      { status: "failed", failure_code: code.slice(0, 64) },
+      {
+        cause: `preparation failed: ${code}`,
+        actor,
+      },
+    );
+    await applyLegChange(
+      p,
+      tx,
+      { ...l, legs: l.legs.map((g) => (g.id === legId ? failed : g)) },
+      leg,
+      failed,
+      null,
       actor,
-    });
-    await applyLegChange(p, tx, { ...l, legs: l.legs.map((g) => (g.id === legId ? failed : g)) }, leg, failed, null, actor);
+    );
   });
 }
 
@@ -679,7 +717,8 @@ function prepareError(o: { code: string; message?: string; param?: string }): Ap
     "quote_rejected",
     "refund_address_invalid",
   ];
-  if (known.includes(code)) return new ApiError(code as never, code === "refund_address_invalid" ? { ...opts, param: "address" } : opts);
+  if (known.includes(code))
+    return new ApiError(code as never, code === "refund_address_invalid" ? { ...opts, param: "address" } : opts);
   if (code === "invalid_request") return ApiError.invalid(o.message ?? "the refund leg request is invalid");
   return new ApiError("rail_unavailable", { params: { reason: code } });
 }
@@ -839,8 +878,7 @@ async function applyLegChange(
       .onConflict((oc) => oc.doNothing())
       .execute();
   }
-  if (decision.events.length)
-    refund = await emitRefundEvents(p, tx, refund, rows.intent, decision.events, previous);
+  if (decision.events.length) refund = await emitRefundEvents(p, tx, refund, rows.intent, decision.events, previous);
   if (decision.duplicate) {
     p.metrics.refund("duplicate_leg");
     p.log.warn({ refund: refund.id, leg: leg.number }, "ALERT refund leg settled as a duplicate (extra_amount_sent)");
@@ -866,7 +904,10 @@ async function applyLegExecution(p: Payments, tx: Tx, l: Locked, leg: LegRow, x:
           ? (x.held_reason ?? (x.state === "succeeded" ? "evidence_missing" : x.state)).slice(0, 64)
           : (x.failure_code ?? x.refund_reason ?? leg.failure_code ?? null),
     },
-    { cause: `execution ${x.id} v${x.version}: ${x.state}${x.provider_status ? ` (${x.provider_status})` : ""}`, actor },
+    {
+      cause: `execution ${x.id} v${x.version}: ${x.state}${x.provider_status ? ` (${x.provider_status})` : ""}`,
+      actor,
+    },
   );
   await applyLegChange(p, tx, { ...l, legs: l.legs.map((g) => (g.id === leg.id ? after : g)) }, leg, after, x, actor);
 }
@@ -876,7 +917,11 @@ const UNKNOWN_GRACE_MS = 2 * 60_000;
 
 /** Consumer path (§8.4 "execution events"): the leg is found by execution id; version-checked. */
 export async function applyRefundExecution(p: Payments, tx: Tx, x: Execution): Promise<void> {
-  const row = await tx.selectFrom("refund_legs").select(["id", "refund_id"]).where("execution_id", "=", x.id).executeTakeFirst();
+  const row = await tx
+    .selectFrom("refund_legs")
+    .select(["id", "refund_id"])
+    .where("execution_id", "=", x.id)
+    .executeTakeFirst();
   if (!row) {
     if (p.now() - Date.parse(x.created_at) < UNKNOWN_GRACE_MS)
       throw new Error(`refund execution ${x.id} is not linked to a leg yet (create response in flight)`);
@@ -915,7 +960,12 @@ export async function prepareRefund(p: Payments, m: Merchant, id: string, actor:
   await assertRefundsAllowed(p, m.livemode);
   const { refundId, legId } = await p.db.transaction().execute(async (tx) => {
     const l = await lockOwn(tx, m, id);
-    const mode = prepareMode(l.refund.status, currentOf(l), l.legs.map((g) => g.status), p.now());
+    const mode = prepareMode(
+      l.refund.status,
+      currentOf(l),
+      l.legs.map((g) => g.status),
+      p.now(),
+    );
     if (mode === "state_conflict" || mode === "leg_expired")
       throw conflict(`The refund is ${l.refund.status}; its current leg cannot be replaced now.`);
     const meta: Meta = { cause: `prepare (${mode})`, actor: actor.id };
@@ -960,7 +1010,8 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
   const action = leg0.next_action as { type: string };
 
   if ("tx_hash" in body) {
-    if (action.type !== "sign_and_send") throw conflict("This leg is signed as an Intents payload; submit `signed_intent`.");
+    if (action.type !== "sign_and_send")
+      throw conflict("This leg is signed as an Intents payload; submit `signed_intent`.");
     try {
       await p.rails.submitDepositTx(leg0.execution_id as string, body.tx_hash);
     } catch (e) {
@@ -976,7 +1027,10 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
       const after = await updateLeg(
         tx,
         leg,
-        { submitted_tx: body.tx_hash, ...(leg.status === "awaiting_signature" ? { status: "submitted" as LegStatus } : {}) },
+        {
+          submitted_tx: body.tx_hash,
+          ...(leg.status === "awaiting_signature" ? { status: "submitted" as LegStatus } : {}),
+        },
         { cause: `merchant reported tx ${body.tx_hash}`, actor: actor.id },
       );
       await updateRefund(tx, l.refund, {}, { cause: `leg ${after.number} tx reported`, actor: actor.id });
@@ -1014,11 +1068,24 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
     const l = await lockAll(tx, r0.id);
     const leg = l?.legs.find((g) => g.id === leg0.id);
     if (!l || !leg || leg.status !== "awaiting_signature") return;
-    const after = await updateLeg(tx, leg, { status: "submitted" }, {
-      cause: "merchant-signed payload relayed (agentpay)",
-      actor: actor.id,
-    });
-    await applyLegChange(p, tx, { ...l, legs: l.legs.map((g) => (g.id === leg.id ? after : g)) }, leg, after, null, actor.id);
+    const after = await updateLeg(
+      tx,
+      leg,
+      { status: "submitted" },
+      {
+        cause: "merchant-signed payload relayed (agentpay)",
+        actor: actor.id,
+      },
+    );
+    await applyLegChange(
+      p,
+      tx,
+      { ...l, legs: l.legs.map((g) => (g.id === leg.id ? after : g)) },
+      leg,
+      after,
+      null,
+      actor.id,
+    );
   });
   return viewOf(p, await ownRefund(p, m, id));
 }
@@ -1027,7 +1094,11 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
 export async function cancelRefund(p: Payments, m: Merchant, id: string, actor: Actor) {
   const out = await p.db.transaction().execute(async (tx) => {
     const l = await lockOwn(tx, m, id);
-    const err = canCancel(l.refund.status, currentOf(l), l.legs.map((g) => g.status));
+    const err = canCancel(
+      l.refund.status,
+      currentOf(l),
+      l.legs.map((g) => g.status),
+    );
     if (err)
       throw conflict(
         `The refund is ${l.refund.status}; only a refund waiting for a signature, with nothing submitted, can be canceled.`,
@@ -1035,7 +1106,8 @@ export async function cancelRefund(p: Payments, m: Merchant, id: string, actor: 
     const meta: Meta = { cause: "canceled by the merchant", actor: actor.id };
     const before = budgetFrom(l.refund.budget, l.intent, l.attempt);
     const rows = await writeBudget(tx, l.refund.budget, l, before, release(before, BigInt(l.refund.amount)), meta);
-    for (const g of l.legs) if (g.status === "preparing") await updateLeg(tx, g, { status: "failed", failure_code: "canceled" }, meta);
+    for (const g of l.legs)
+      if (g.status === "preparing") await updateLeg(tx, g, { status: "failed", failure_code: "canceled" }, meta);
     const previous = { status: l.refund.status };
     let r = await updateRefund(tx, l.refund, { status: "canceled", canceled_at: new Date(p.now()) }, meta);
     r = await emitRefundEvents(p, tx, r, rows.intent, ["evt.payments.refund.canceled"], previous);
@@ -1060,7 +1132,11 @@ export async function updateRecipient(
     throw new ApiError("refund_address_invalid", { param: "address", message: `Not a valid address: ${check.reason}` });
   const { legId } = await p.db.transaction().execute(async (tx) => {
     const l = await lockOwn(tx, m, id);
-    const mode = canChangeRecipient(l.refund.status, currentOf(l), l.legs.map((g) => g.status));
+    const mode = canChangeRecipient(
+      l.refund.status,
+      currentOf(l),
+      l.legs.map((g) => g.status),
+    );
     if (mode === "state_conflict" || mode === "leg_expired")
       throw conflict(`The refund is ${l.refund.status}; its recipient can change only before anything is sent.`);
     const meta: Meta = {
@@ -1073,10 +1149,12 @@ export async function updateRecipient(
     if (mode === "reserve") {
       const before = budgetFrom(refund.budget, l.intent, l.attempt);
       const after = reserve(before, BigInt(refund.amount));
-      if (!after) throw new ApiError("amount_exceeds_refundable", { params: { refundable: refundable(before).toString() } });
+      if (!after)
+        throw new ApiError("amount_exceeds_refundable", { params: { refundable: refundable(before).toString() } });
       rows = await writeBudget(tx, refund.budget, rows, before, after, meta);
     }
-    for (const g of l.legs) if (g.status === "preparing") await updateLeg(tx, g, { status: "failed", failure_code: "superseded" }, meta);
+    for (const g of l.legs)
+      if (g.status === "preparing") await updateLeg(tx, g, { status: "failed", failure_code: "superseded" }, meta);
     refund = await updateRefund(
       tx,
       refund,
@@ -1100,7 +1178,8 @@ export async function simulateRefundDeposit(p: Payments, m: Merchant, id: string
   const leg = r.current_leg_id
     ? await p.db.selectFrom("refund_legs").selectAll().where("id", "=", r.current_leg_id).executeTakeFirst()
     : undefined;
-  if (r.status !== "requires_action" || !leg?.next_action) throw conflict(`The refund is ${r.status}; no leg to simulate.`);
+  if (r.status !== "requires_action" || !leg?.next_action)
+    throw conflict(`The refund is ${r.status}; no leg to simulate.`);
   if (leg.status === "expired" || !leg.deadline || leg.deadline.getTime() <= p.now()) throw new ApiError("leg_expired");
   if (leg.status !== "awaiting_signature" && leg.status !== "submitted") throw conflict(`The leg is ${leg.status}.`);
   const a = leg.next_action as { type: string };
@@ -1132,7 +1211,11 @@ export async function simulateRefundDeposit(p: Payments, m: Merchant, id: string
 export async function refundReceiptContext(p: Payments, id: string) {
   const r = await p.db.selectFrom("refunds").selectAll().where("id", "=", toUuid(id, "re")).executeTakeFirst();
   if (!r) throw ApiError.missing("refund", id);
-  const i = await p.db.selectFrom("payment_intents").selectAll().where("id", "=", r.payment_intent_id).executeTakeFirstOrThrow();
+  const i = await p.db
+    .selectFrom("payment_intents")
+    .selectAll()
+    .where("id", "=", r.payment_intent_id)
+    .executeTakeFirstOrThrow();
   const [email, ctx, name] = await Promise.all([
     receiptEmail(p, i),
     settlementContext(p, i.account_id, i.livemode),
@@ -1158,7 +1241,13 @@ export async function refundReceiptContext(p: Payments, id: string) {
     payment_intent: fromUuid("pi", i.id),
     original_amount: pricing.amount,
     original_currency: pricing.currency,
-    refunded: settlementValue(r.amount, i.settlement_asset_id, i.settlement_decimals, i.settlement_symbol, i.destination_snapshot.chain),
+    refunded: settlementValue(
+      r.amount,
+      i.settlement_asset_id,
+      i.settlement_decimals,
+      i.settlement_symbol,
+      i.destination_snapshot.chain,
+    ),
     received,
     recipient_display: `${shortAddress(r.recipient)} on ${chainName}`,
     evidence_links: url ? [url] : [],

@@ -11,10 +11,8 @@ import { amountFilters, fiatPredicate, SQL_OP } from "../domain/payment-intent/f
 import { canCancel, type IntentStatus, type SessionStatus } from "../domain/payment-intent/intent.js";
 import { reviewOutcome } from "../domain/payment-intent/review.js";
 import { countLinkUse } from "./apply.js";
-import { assertRefundsAllowed } from "./kill-switch.js";
-import { type Actor, insertRefund, prepareAndReport } from "./refunds.js";
-import { attachableCustomer, openSession } from "./sessions.js";
 import type { Payments } from "./context.js";
+import { assertRefundsAllowed } from "./kill-switch.js";
 import {
   attemptsOf,
   emitIntentEvents,
@@ -26,7 +24,9 @@ import {
   updateSession,
 } from "./ledger.js";
 import { type PageQuery, pageOf } from "./pages.js";
+import { type Actor, insertRefund, prepareAndReport } from "./refunds.js";
 import type { Merchant, SessionCreate } from "./sessions.js";
+import { attachableCustomer, openSession } from "./sessions.js";
 import { type AttemptRow, type IntentRow, intentView } from "./views.js";
 
 export async function withRelations(p: Payments, intents: readonly IntentRow[]) {
@@ -133,7 +133,8 @@ export async function listIntents(p: Payments, m: Merchant, q: IntentListQuery) 
           : sql<boolean>`amount ${sql.raw(SQL_OP[fiat.op])} ${fiat.value.toString()}::bigint`;
     if (q.currency === "asset") base = base.where(assetCmp);
     else if (q.currency) base = base.where(fiatCmp);
-    else base = base.where(sql<boolean>`((currency <> 'asset' and ${fiatCmp}) or (currency = 'asset' and ${assetCmp}))`);
+    else
+      base = base.where(sql<boolean>`((currency <> 'asset' and ${fiatCmp}) or (currency = 'asset' and ${assetCmp}))`);
   }
   const meta = metadataFilters(q as Record<string, unknown>);
   if (Object.keys(meta).length) base = base.where(sql<boolean>`metadata @> ${JSON.stringify(meta)}::jsonb`);
@@ -262,7 +263,9 @@ export async function reviewIntent(
         message: "A held verification has no settlement evidence yet; it resolves itself when evidence arrives.",
       });
     if (o === "state_conflict")
-      throw new ApiError("state_conflict", { message: `The intent is ${i.status}; only an intent in review is decided.` });
+      throw new ApiError("state_conflict", {
+        message: `The intent is ${i.status}; only an intent in review is decided.`,
+      });
     const now = new Date(p.now());
     const meta = {
       cause: `review ${body.decision} by the merchant${body.reason ? `: ${body.reason}` : ""}`,
@@ -328,7 +331,9 @@ export async function reviewIntent(
       s = await updateSession(
         tx,
         s,
-        o.session.status === "complete" ? { status: "complete", completed_at: now, late: o.session.late } : { status: "expired" },
+        o.session.status === "complete"
+          ? { status: "complete", completed_at: now, late: o.session.late }
+          : { status: "expired" },
         meta,
       );
     if (o.session?.status === "expired") await hideAttempts(tx, i.id);
@@ -339,7 +344,10 @@ export async function reviewIntent(
   if (out.s) await p.notifier.publish(out.s.id);
   if (out.refundId && out.legId)
     await prepareAndReport(p, out.refundId, out.legId, actor.id).catch((e) =>
-      p.log.warn({ refund: out.refundId, err: e instanceof Error ? e.message : String(e) }, "draft refund leg not prepared"),
+      p.log.warn(
+        { refund: out.refundId, err: e instanceof Error ? e.message : String(e) },
+        "draft refund leg not prepared",
+      ),
     );
   const [v] = await withRelations(p, [out.i]);
   return v as NonNullable<typeof v>;

@@ -39,6 +39,7 @@ import { STREAMS, type Subject } from "@nearpay-internal/spec";
 import { paymentsRoutes } from "../api/routes.js";
 import type { ApiConfig, SharedConfig, WorkerConfig } from "../config.js";
 import { deadLetters, paymentsHandlers } from "../consumers/handlers.js";
+import { type Nonces, verifierNonces } from "../infra/clients/near.js";
 import {
   type Agentpay,
   agentpayClient,
@@ -51,7 +52,6 @@ import {
   type Sandbox,
   sandboxClient,
 } from "../infra/clients/peers.js";
-import { type Nonces, verifierNonces } from "../infra/clients/near.js";
 import { type Turnstile, turnstileClient, turnstileDisabled } from "../infra/clients/turnstile.js";
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
 import type { DB } from "../infra/db/schema.js";

@@ -14,11 +14,7 @@ export interface Nonces {
   fresh(livemode: boolean): Promise<string>;
 }
 
-export function verifierNonces(o: {
-  rpcUrls: readonly string[];
-  fetch?: typeof fetch;
-  now?: () => number;
-}): Nonces {
+export function verifierNonces(o: { rpcUrls: readonly string[]; fetch?: typeof fetch; now?: () => number }): Nonces {
   const rpc = intentsRpc({ rpcUrls: [...o.rpcUrls], timeoutMs: 2_000, ...(o.fetch ? { fetch: o.fetch } : {}) });
   const now = o.now ?? Date.now;
   let cached: { salt: string; at: number } | null = null;

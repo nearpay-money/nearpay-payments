@@ -23,8 +23,8 @@ import {
   createExecution,
   createInternalCase,
   createRefundExecution,
-  estimateSettlement,
   type Execution,
+  estimateSettlement,
   getDestinationMinimums,
   getEvidenceSummary,
   getExecution,
@@ -119,8 +119,7 @@ export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
         idempotencyKey: `signal:${id}:${Date.now()}`,
       });
     },
-    createRefundExecution: (body) =>
-      write.call(createRefundExecution, { body, idempotencyKey: body.idempotency_key }),
+    createRefundExecution: (body) => write.call(createRefundExecution, { body, idempotencyKey: body.idempotency_key }),
     fxRates: (livemode, currencies) =>
       read.call(listFxRates, {
         query: { livemode: livemode ? "true" : "false", currencies: currencies.join(",") } as never,

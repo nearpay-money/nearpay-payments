@@ -256,10 +256,7 @@ export function reconcile(lines: readonly StatementLine[], evidence: readonly Ev
   const totals: Totals[] = [...acc.entries()]
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
     .map(([asset, a]) => {
-      const observed =
-        feesComparable && (a.feeRelevant || a.feeObserved > 0n)
-          ? a.feeObserved.toString()
-          : null;
+      const observed = feesComparable && (a.feeRelevant || a.feeObserved > 0n) ? a.feeObserved.toString() : null;
       if (observed !== null && BigInt(observed) !== a.feeExpected)
         diff({
           kind: "fee_mismatch",
@@ -274,7 +271,12 @@ export function reconcile(lines: readonly StatementLine[], evidence: readonly Ev
         });
       return {
         asset_id: asset,
-        inflow: { statement: a.inflow.s.toString(), evidence: a.inflow.e.toString(), statement_lines: a.inflow.l, executions: a.inflow.x },
+        inflow: {
+          statement: a.inflow.s.toString(),
+          evidence: a.inflow.e.toString(),
+          statement_lines: a.inflow.l,
+          executions: a.inflow.x,
+        },
         outflow: {
           statement: a.outflow.s.toString(),
           evidence: a.outflow.e.toString(),

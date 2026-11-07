@@ -17,7 +17,7 @@ export interface Operator {
 /** The console operator of an ops route (`ptype=ops`, `ops_role` claim). */
 export function operatorOf(ctx: Pick<RequestContext, "principal">): Operator {
   const c = ctx.principal as { ptype?: string; sub?: string; ops_role?: string } | null;
-  if (!c || c.ptype !== "ops" || !c.sub) throw new ApiError("authentication_required");
+  if (c?.ptype !== "ops" || !c.sub) throw new ApiError("authentication_required");
   if (c.ops_role !== "ops" && c.ops_role !== "ops_admin")
     throw new ApiError("permission_denied", { message: "The console session carries no ops role." });
   return { sub: c.sub, opsRole: c.ops_role };

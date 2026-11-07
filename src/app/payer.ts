@@ -112,17 +112,18 @@ export async function paymentOptions(
   if (pricing.kind === "fiat" && pricing.currency !== "usd")
     // non-USD prices are valued by rails (FX, ADR-0020 d5); no estimate → no options (manual path)
     amountOut = await railsSettlementEstimate(p, pricing, d.asset_id, i.livemode);
-  else try {
-    const dest = await assetInfo(p, d.asset_id, i.livemode);
-    const pa =
-      pricing.kind === "asset" && pricing.assetId !== d.asset_id
-        ? await assetInfo(p, pricing.assetId, i.livemode)
-        : null;
-    const info = (a: typeof dest) => ({ decimals: a.decimals, priceUsd: a.price_usd, isUsdStable: a.is_usd_stable });
-    amountOut = settlementEstimate(pricing, { ...info(dest), assetId: d.asset_id }, pa ? info(pa) : null);
-  } catch {
-    amountOut = null;
-  }
+  else
+    try {
+      const dest = await assetInfo(p, d.asset_id, i.livemode);
+      const pa =
+        pricing.kind === "asset" && pricing.assetId !== d.asset_id
+          ? await assetInfo(p, pricing.assetId, i.livemode)
+          : null;
+      const info = (a: typeof dest) => ({ decimals: a.decimals, priceUsd: a.price_usd, isUsdStable: a.is_usd_stable });
+      amountOut = settlementEstimate(pricing, { ...info(dest), assetId: d.asset_id }, pa ? info(pa) : null);
+    } catch {
+      amountOut = null;
+    }
   if (amountOut === null || amountOut <= 0n) return { object: "payment_options" as const, options: [] };
   let options: InternalOption[];
   try {

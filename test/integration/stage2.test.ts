@@ -7,10 +7,13 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { newId } from "@nearpay-internal/ids";
 import { signNep413 } from "@nearpay-internal/intents";
 import { createRefundExecution, relaySignedIntent } from "@nearpay-internal/spec";
-import { domainEvent, expectEvent } from "@nearpay-internal/testing";
+import { domainEvent, expectEvent, mockError } from "@nearpay-internal/testing";
+import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { valkeyLimiter } from "../../src/infra/rate-limiter.js";
 import { type Merchant, type Stack, startStack, USDC_NEAR, uuid } from "../support/stack.js";
 import { agentpayRelayBody, type Evidence, freshEvidence, type PaidIntent } from "../support/stage2.js";
 
@@ -775,6 +778,15 @@ describe("refunds", () => {
     const m = st.merchant({ livemode: true });
     const paid = await paidIntent(m, { livemode: true });
     const acct = uuid(m.account, "acct");
+    // finding 8: no sentinel state applied yet → unknown → fail closed for live refunds
+    expect(await st.admin.db.selectFrom("kill_switch").selectAll().executeTakeFirst()).toBeUndefined();
+    const unknown = await st.call("POST", "/v1/refunds", {
+      token: paid.token,
+      body: { payment_intent: paid.pi, amount: "1000" },
+    });
+    expect(unknown.status).toBe(503);
+    expect(unknown.body.error).toMatchObject({ code: "rail_unavailable" });
+    expect(unknown.body.error.message).toMatch(/state is known/);
     await st.publishEvent(
       domainEvent(
         "evt.sentinel.kill_switch.engaged",
@@ -953,5 +965,246 @@ describe("reconciliation (console)", () => {
     expect(merchant.status).toBe(403);
     const unknown = await st.call("GET", "/ops/reconciliation_runs/rcn_00000000000000000000000000", { token: ops });
     expect(unknown.status).toBe(404);
+  });
+});
+
+// ==================================================================================== stage 2 audit fixes
+
+describe("audit fixes (lld/payments.md §18)", () => {
+  const sessionsOf = (link: string, ip: string) =>
+    st.call("POST", `/v1/payment_links/${link}/public/sessions`, { body: {}, headers: { "x-forwarded-for": ip } });
+
+  it("finding 3: link limits per client network, a creation-only link ceiling, unknown ids cost nothing, Valkey", async () => {
+    const settings = st.payments.settings as unknown as Record<string, number>;
+    const saved = { ...settings };
+    Object.assign(settings, { linkSessionsPerIp: 3, linkSessionsPerLinkClient: 2, linkSessionsPerLink: 3 });
+    try {
+      const token = await st.token(st.merchant());
+      const mk = async () =>
+        (
+          await st.call("POST", "/v1/payment_links", {
+            token,
+            body: { amount: 200, currency: "usd", description: "x" },
+          })
+        ).body.id as string;
+      const link = await mk();
+      // unknown link ids are answered before anything is counted
+      for (let n = 0; n < 4; n++)
+        expect((await sessionsOf("plink_01jbz9k3m4n5p6q7r8s9t0v1w2", "192.0.2.1")).status).toBe(404);
+      expect((await sessionsOf(link, "198.51.100.7")).status).toBe(201);
+      expect((await sessionsOf(link, "198.51.100.200")).status).toBe(201);
+      // a third session from the same /24 is refused for that client network only
+      const third = await sessionsOf(link, "198.51.100.9");
+      expect(third.status).toBe(429);
+      expect(Number(third.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+      expect((await sessionsOf(link, "203.0.113.5")).status).toBe(201);
+      // the per-link ceiling (3) throttles creation, never reads
+      expect((await sessionsOf(link, "192.0.2.1")).status).toBe(429);
+      expect((await st.call("GET", `/v1/payment_links/${link}/public`)).status).toBe(200);
+      // 192.0.2.1 spent nothing on unknown ids or refused requests: it still opens a session elsewhere
+      expect((await sessionsOf(await mk(), "192.0.2.1")).status).toBe(201);
+
+      // the api counts in Valkey, and two replicas share the windows
+      const url = st.valkeyUrl as string;
+      const r = new Redis(url);
+      expect((await r.keys("np:payments:rl:plink:*")).length).toBeGreaterThan(0);
+      await r.quit();
+      const a = valkeyLimiter(url);
+      const b = valkeyLimiter(url);
+      await waitFor(async () => a.backend() === "valkey" && b.backend() === "valkey");
+      const lim = [{ key: `shared-${Date.now()}`, max: 2 }];
+      expect((await a.take(lim, Date.now(), 60_000)).ok).toBe(true);
+      expect((await b.take(lim, Date.now(), 60_000)).ok).toBe(true);
+      expect((await a.take(lim, Date.now(), 60_000)).ok).toBe(false);
+      await a.close();
+      await b.close();
+      // Valkey unreachable → the in-process fallback still limits
+      const down = valkeyLimiter("redis://127.0.0.1:9");
+      expect((await down.take(lim, Date.now(), 60_000)).ok).toBe(true);
+      expect((await down.take(lim, Date.now(), 60_000)).ok).toBe(true);
+      expect((await down.take(lim, Date.now(), 60_000)).ok).toBe(false);
+      await down.close();
+    } finally {
+      Object.assign(settings, saved);
+    }
+  });
+
+  it("finding 12: max_uses holds under concurrent session creation; an expired session gives its use back", async () => {
+    const token = await st.token(st.merchant());
+    const l = await st.call("POST", "/v1/payment_links", {
+      token,
+      body: { amount: 200, currency: "usd", description: "limited", max_uses: 2 },
+    });
+    const all = await Promise.all(Array.from({ length: 8 }, (_, n) => sessionsOf(l.body.id, `203.0.113.${n + 10}`)));
+    const opened = all.filter((r) => r.status === 201);
+    expect(opened).toHaveLength(2);
+    for (const r of all.filter((x) => x.status !== 201)) expect(r.body.error.code).toBe("link_inactive");
+    const exp = await st.call("POST", `/v1/checkout/sessions/${opened[0]?.body.checkout_session}/expire`, {
+      token,
+      body: {},
+    });
+    expect(exp.status).toBe(200);
+    expect((await sessionsOf(l.body.id, "203.0.113.40")).status).toBe(201);
+    const full = await sessionsOf(l.body.id, "203.0.113.41");
+    expect(full.body.error.code).toBe("link_inactive");
+    expect(full.body.error.message).toMatch(/held by a checkout in progress/);
+  });
+
+  it("finding 5: a cancel racing the relay is refused; a refused relay re-opens the leg; an unknown outcome keeps it", async () => {
+    const paid = await paidIntent();
+    const sk = new Uint8Array(randomBytes(32));
+    const mkRefund = async () => {
+      const r = await st.call("POST", "/v1/refunds", {
+        token: paid.token,
+        body: { payment_intent: paid.pi, amount: "600000" },
+      });
+      expect(r.status).toBe(201);
+      return { id: r.body.id as string, signed: signNep413(JSON.parse(r.body.next_action.payload), sk) };
+    };
+    const submit = (id: string, signed: unknown) =>
+      st.call("POST", `/v1/refunds/${id}/submit_tx`, { token: paid.token, body: { signed_intent: signed } });
+    const cancel = (id: string) => st.call("POST", `/v1/refunds/${id}/cancel`, { token: paid.token, body: {} });
+    const legStatus = async (id: string) =>
+      (
+        await st.admin.db
+          .selectFrom("refund_legs")
+          .select("status")
+          .where("refund_id", "=", uuid(id, "re"))
+          .executeTakeFirstOrThrow()
+      ).status;
+    try {
+      // 1. relay in progress: cancel refused, the reservation stays
+      let release: () => void = () => {};
+      const gate = new Promise<void>((res) => {
+        release = res;
+      });
+      st.agentpay.on(relaySignedIntent, async () => {
+        await gate;
+        return { agent_payment_id: newId("ap") };
+      });
+      const r1 = await mkRefund();
+      const pending = submit(r1.id, r1.signed);
+      await waitFor(async () => (await legStatus(r1.id)) === "submitting");
+      expect((await cancel(r1.id)).body.error.code).toBe("state_conflict");
+      const mid = (await st.call("GET", `/v1/refunds/${r1.id}`, { token: paid.token })).body;
+      expect(mid).toMatchObject({ status: "requires_action", next_action: null });
+      expect(mid.legs[0].status).toBe("submitted");
+      release();
+      expect((await pending).body.status).toBe("pending");
+      expect(
+        (await st.call("GET", `/v1/payment_intents/${paid.pi}`, { token: paid.token })).body.amount_refund_pending,
+      ).toBe("600000");
+
+      // 2. agentpay refuses (nothing published): the leg awaits a signature again and can be canceled
+      st.agentpay.on(relaySignedIntent, async () => mockError("insufficient_balance" as never));
+      const r2 = await mkRefund();
+      expect((await submit(r2.id, r2.signed)).body.error.code).toBe("insufficient_balance");
+      expect(await legStatus(r2.id)).toBe("awaiting_signature");
+      expect((await cancel(r2.id)).body.status).toBe("canceled");
+
+      // 3. unknown outcome: the leg stays submitting (cancel refused); the same payload is taken again
+      st.agentpay.on(relaySignedIntent, async () => {
+        throw new Error("agentpay is down");
+      });
+      const r3 = await mkRefund();
+      expect((await submit(r3.id, r3.signed)).body.error.code).toBe("rail_unavailable");
+      expect(await legStatus(r3.id)).toBe("submitting");
+      expect((await cancel(r3.id)).body.error.code).toBe("state_conflict");
+      st.agentpay.on(relaySignedIntent, async () => ({ agent_payment_id: newId("ap") }));
+      expect((await submit(r3.id, r3.signed)).body.status).toBe("pending");
+    } finally {
+      st.agentpay.on(relaySignedIntent, async () => ({ agent_payment_id: newId("ap") }));
+    }
+  });
+
+  it("finding 6: a late create response after a cancel does not revive the leg", async () => {
+    const paid = await paidIntent();
+    let release: () => void = () => {};
+    const gate = new Promise<void>((res) => {
+      release = res;
+    });
+    let created = false;
+    st.onRefundCreate(async () => {
+      created = true;
+      await gate;
+    });
+    try {
+      const pending = st.call("POST", "/v1/refunds", {
+        token: paid.token,
+        body: { payment_intent: paid.pi, amount: "700000" },
+      });
+      await waitFor(async () => created);
+      const row = await st.admin.db
+        .selectFrom("refunds")
+        .select("id")
+        .where("payment_intent_id", "=", uuid(paid.pi, "pi"))
+        .orderBy("created_at", "desc")
+        .executeTakeFirstOrThrow();
+      const id = (await st.call("GET", `/v1/refunds?payment_intent=${paid.pi}`, { token: paid.token })).body.data[0]
+        .id as string;
+      expect((await st.call("POST", `/v1/refunds/${id}/cancel`, { token: paid.token, body: {} })).body.status).toBe(
+        "canceled",
+      );
+      release();
+      const out = await pending;
+      expect(out.body.status).toBe("canceled");
+      expect(out.body.next_action).toBeNull();
+      const leg = await st.admin.db
+        .selectFrom("refund_legs")
+        .selectAll()
+        .where("refund_id", "=", row.id)
+        .executeTakeFirstOrThrow();
+      expect(leg).toMatchObject({ status: "failed", failure_code: "canceled" });
+      expect(leg.execution_id).not.toBeNull();
+      const note = await st.admin.db
+        .selectFrom("refund_leg_transitions")
+        .selectAll()
+        .where("refund_leg_id", "=", leg.id)
+        .where("from_state", "=", "failed")
+        .where("to_state", "=", "failed")
+        .executeTakeFirst();
+      expect(note?.cause).toMatch(/ignored/);
+    } finally {
+      st.onRefundCreate(null);
+      release();
+    }
+  });
+
+  it("finding 7: instructions that do not match the leg fail it and are never shown", async () => {
+    try {
+      // Intents transfer to someone else than the refund recipient
+      const paid = await paidIntent();
+      st.onRefundCreate((x) => {
+        (x.refund?.transfer as { receiver_id: string }).receiver_id = "evil.near";
+      });
+      const bad = await st.call("POST", "/v1/refunds", {
+        token: paid.token,
+        body: { payment_intent: paid.pi, amount: "800000" },
+      });
+      expect(bad.status).toBe(503);
+      expect(bad.body.error.code).toBe("rail_unavailable");
+      const [r] = (await st.call("GET", `/v1/refunds?payment_intent=${paid.pi}`, { token: paid.token })).body.data;
+      expect(r).toMatchObject({ status: "failed", failure_code: "execution_mismatch", next_action: null });
+      expect(JSON.stringify(r)).not.toContain("evil.near");
+      expect(
+        (await st.call("GET", `/v1/payment_intents/${paid.pi}`, { token: paid.token })).body.amount_refund_pending,
+      ).toBe("0");
+
+      // EXACT_INPUT deposit for another amount (chain destination)
+      const m = st.merchant({ type: "chain_address" });
+      const chain = await paidIntent(m);
+      st.onRefundCreate((x) => {
+        (x.deposit as { amount_in: string }).amount_in = "1";
+      });
+      const short = await st.call("POST", "/v1/refunds", {
+        token: chain.token,
+        body: { payment_intent: chain.pi, amount: "900000", fee_mode: "payer_absorbs" },
+      });
+      expect(short.status).toBe(503);
+      const [c] = (await st.call("GET", `/v1/refunds?payment_intent=${chain.pi}`, { token: chain.token })).body.data;
+      expect(c).toMatchObject({ status: "failed", failure_code: "execution_mismatch", next_action: null });
+    } finally {
+      st.onRefundCreate(null);
+    }
   });
 });

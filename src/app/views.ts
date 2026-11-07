@@ -289,7 +289,8 @@ export function legViews(legs: readonly LegRow[]): RefundView["legs"] {
     .sort((a, b) => b.number - a.number)
     .map((l) => ({
       number: l.number,
-      status: l.status as RefundView["legs"][number]["status"],
+      // `submitting` is internal (the relay is in progress): the merchant has submitted
+      status: (l.status === "submitting" ? "submitted" : l.status) as RefundView["legs"][number]["status"],
       method: l.method,
       swap_type: l.swap_type,
       amount: l.amount,

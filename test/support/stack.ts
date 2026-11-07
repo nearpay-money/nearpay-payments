@@ -100,6 +100,10 @@ export interface Stack {
   opsToken(o?: { role?: "ops" | "ops_admin"; stepUp?: boolean }): Promise<string>;
   /** Makes the next `n` refund-leg creates fail transiently / answer a definitive error. */
   failRefundCreates(n: number, code?: string): void;
+  /** Runs `fn` on every refund execution rails creates, before it answers (tamper, hold); null clears it. */
+  onRefundCreate(fn: ((x: Execution) => void | Promise<void>) | null): void;
+  /** Valkey of the stack (with a worker), else null. */
+  readonly valkeyUrl: string | null;
   /** Day (`YYYY-MM-DD`) rails files evidence under, and whether that day is complete. */
   evidenceDay: { day: string; complete: boolean };
   call(
@@ -332,6 +336,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     executions.set(x.id, x);
     return x;
   });
+  let refundCreateHook: ((x: Execution) => void | Promise<void>) | null = null;
   rails.on(createRefundExecution, async (ctx) => {
     const b = ctx.body;
     if (failRefunds > 0) {
@@ -404,6 +409,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     } as never);
     Object.defineProperty(x, "_key", { value: b.idempotency_key, enumerable: false });
     executions.set(x.id, x);
+    if (refundCreateHook) await refundCreateHook(x);
     return x;
   });
   rails.on(listFxRates, async (ctx) => {
@@ -550,6 +556,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     nearRpcUrls: ["http://127.0.0.1:9"],
     linkSessionsPerIp: 1000,
     linkSessionsPerLink: 1000,
+    linkSessionsPerLinkClient: 1000,
     turnstileOutageLimit: 5,
     natsUrl: nats?.url ?? "nats://127.0.0.1:9",
     ...(valkey ? { valkeyUrl: valkey.url } : {}),
@@ -598,6 +605,10 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     worker,
     nats,
     executions,
+    valkeyUrl: valkey?.url ?? null,
+    onRefundCreate(fn) {
+      refundCreateHook = fn;
+    },
     merchant(m = {}) {
       const acct = newId("acct");
       const sd = newId("sd");

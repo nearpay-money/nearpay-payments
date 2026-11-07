@@ -15,7 +15,9 @@ import {
   type Budget,
   canCancel,
   isConsistent,
+  LEG_TERMINAL,
   type LegStatus,
+  legStatusOf,
   onLegChange,
   prepareMode,
   type RefundBook,
@@ -40,7 +42,9 @@ type Cmd =
   | { t: "leg"; r: number; l: number; to: LegStatus }
   | { t: "cancel"; r: number }
   | { t: "prepare"; r: number }
-  | { t: "relay"; r: number };
+  | { t: "relay"; r: number }
+  | { t: "relay_start"; r: number }
+  | { t: "relay_end"; r: number; accepted: boolean };
 
 const LEG_TARGETS: LegStatus[] = ["processing", "succeeded", "returned", "failed", "expired", "held"];
 const TERMINAL = new Set<LegStatus>(["succeeded", "returned", "failed"]);
@@ -56,6 +60,12 @@ const cmd = fc.oneof(
   { weight: 1, arbitrary: fc.nat(4).map((r) => ({ t: "cancel", r }) as Cmd) },
   { weight: 2, arbitrary: fc.nat(4).map((r) => ({ t: "prepare", r }) as Cmd) },
   { weight: 1, arbitrary: fc.nat(4).map((r) => ({ t: "relay", r }) as Cmd) },
+  // finding 5: a relay is two steps (submitting under the lock, then agentpay's answer)
+  { weight: 1, arbitrary: fc.nat(4).map((r) => ({ t: "relay_start", r }) as Cmd) },
+  {
+    weight: 1,
+    arbitrary: fc.record({ r: fc.nat(4), accepted: fc.boolean() }).map((o) => ({ t: "relay_end", ...o }) as Cmd),
+  },
 );
 
 function run(settled: bigint, cmds: Cmd[]) {
@@ -122,6 +132,15 @@ function run(settled: bigint, cmds: Cmd[]) {
       } else if (c.t === "relay") {
         if (r.book.status !== "requires_action" || cur.status !== "awaiting_signature") continue;
         applyLeg(r, cur, "submitted");
+      } else if (c.t === "relay_start") {
+        if (r.book.status !== "requires_action" || cur.status !== "awaiting_signature") continue;
+        applyLeg(r, cur, "submitting");
+      } else if (c.t === "relay_end") {
+        const leg = r.legs.find((g) => g.status === "submitting");
+        if (!leg) continue;
+        // the payload left with the refund still holding its reservation: nothing canceled it meanwhile
+        if (c.accepted) expect(["requires_action", "pending"]).toContain(r.book.status);
+        applyLeg(r, leg, c.accepted ? "submitted" : "awaiting_signature");
       }
     }
 
@@ -171,6 +190,20 @@ describe("refund interleavings (property)", () => {
     expect(refunds[0]?.book).toMatchObject({ status: "succeeded", counted: 100n, extra: 100n });
   });
 
+  it("a cancel racing the relay is refused: the relayed refund keeps its reservation (finding 5)", () => {
+    const { budget, refunds } = run(100n, [
+      { t: "create", amount: 100n },
+      { t: "relay_start", r: 0 },
+      { t: "cancel", r: 0 },
+      { t: "create", amount: 100n },
+      { t: "relay_end", r: 0, accepted: true },
+      { t: "leg", r: 0, l: 0, to: "succeeded" },
+    ]);
+    expect(refunds).toHaveLength(1);
+    expect(refunds[0]?.book).toMatchObject({ status: "succeeded", counted: 100n, extra: 0n });
+    expect(budget).toEqual({ settled: 100n, refunded: 100n, pending: 0n });
+  });
+
   it("a canceled refund whose leg settles after another refund took the budget counts only what fits", () => {
     const { budget, refunds } = run(100n, [
       { t: "create", amount: 60n },
@@ -180,5 +213,43 @@ describe("refund interleavings (property)", () => {
     ]);
     expect(budget).toEqual({ settled: 100n, refunded: 30n, pending: 70n });
     expect(refunds[0]?.book).toMatchObject({ status: "succeeded", counted: 30n, extra: 30n });
+  });
+});
+
+describe("leg status from execution states (property, finding 6)", () => {
+  const STATES = [
+    "quoting",
+    "awaiting_deposit",
+    "deposit_detected",
+    "incomplete_deposit",
+    "settling",
+    "verifying",
+    "succeeded",
+    "refunded",
+    "failed",
+    "expired_unpaid",
+    "held",
+  ];
+  const STARTS: LegStatus[] = ["awaiting_signature", "submitting", "submitted", "processing", "failed", "succeeded"];
+  it("a leg that is over only ever follows money that moved", () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom(...STARTS),
+        fc.array(fc.record({ state: fc.constantFrom(...STATES), evidence: fc.boolean() }), { maxLength: 30 }),
+        (start, xs) => {
+          let leg = start;
+          let over = LEG_TERMINAL.has(leg);
+          for (const x of xs) {
+            const next = legStatusOf(x.state, x.evidence, leg);
+            // never back to a state where the merchant could be asked to sign or send again
+            if (over) expect(["awaiting_signature", "submitting", "submitted", "preparing"]).not.toContain(next);
+            if (leg !== "awaiting_signature" && leg !== "preparing") expect(next).not.toBe("awaiting_signature");
+            leg = next;
+            over = over || LEG_TERMINAL.has(leg);
+          }
+        },
+      ),
+      { numRuns: 1000 },
+    );
   });
 });

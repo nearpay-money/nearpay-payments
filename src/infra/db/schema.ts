@@ -260,6 +260,7 @@ export type RefundStatus = "requires_action" | "pending" | "succeeded" | "failed
 export type LegStatus =
   | "preparing"
   | "awaiting_signature"
+  | "submitting"
   | "submitted"
   | "processing"
   | "succeeded"

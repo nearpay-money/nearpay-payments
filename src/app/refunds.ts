@@ -40,6 +40,7 @@ import {
   type LegStatus,
   legIdempotencyKey,
   legStatusOf,
+  legUpdateOf,
   onLegChange,
   prepareErrorOf,
   prepareMode,
@@ -584,18 +585,35 @@ async function callRails(p: Payments, refundId: string, legId: string): Promise<
   }
 }
 
-/** The exact next action for a prepared leg; throws when the execution lacks what the merchant must sign. */
-async function nextActionOf(p: Payments, r: RefundRow, i: IntentRow, x: Execution) {
+/** Rails answered with instructions that do not match the leg (finding 7): never shown to the merchant. */
+export class ExecutionMismatch extends Error {}
+
+/**
+ * The exact next action for a prepared leg; throws when the execution lacks what the merchant must sign,
+ * and `ExecutionMismatch` when its instructions differ from the leg (defence in depth against a rails or
+ * provider fault): the amount of an `EXACT_INPUT` deposit or of an Intents transfer must be the leg's
+ * amount, the transfer must move the refund asset from the destination, and an `intents_transfer` leg
+ * must pay the refund recipient.
+ */
+async function nextActionOf(p: Payments, r: RefundRow, i: IntentRow, leg: LegRow, x: Execution) {
   const asset = { symbol: i.settlement_symbol, decimals: i.settlement_decimals };
+  const mismatch = (what: string) =>
+    new ExecutionMismatch(`execution ${x.id}: ${what} does not match leg ${leg.number}`);
+  const exactInput = r.method === "intents_transfer" || leg.swap_type === "EXACT_INPUT";
   const t = x.refund?.transfer;
   if (t) {
-    if (BigInt(t.amount) <= 0n || t.signer_id !== i.destination_snapshot.address)
-      throw new Error(`execution ${x.id}: refund transfer does not match the destination`);
+    if (BigInt(t.amount) <= 0n || t.signer_id !== i.destination_snapshot.address) throw mismatch("transfer signer");
+    if (t.token !== i.settlement_asset_id) throw mismatch(`transfer token ${t.token}`);
+    if (exactInput && BigInt(t.amount) !== BigInt(leg.amount)) throw mismatch(`transfer amount ${t.amount}`);
+    if (r.method === "intents_transfer" && t.receiver_id !== r.recipient)
+      throw mismatch(`transfer receiver ${t.receiver_id}`);
     const nonce = await p.nonces.fresh(r.livemode);
     return { action: signIntentAction(t, nonce, asset), nonce, deadline: new Date(t.deadline), amount: t.amount };
   }
   const dep = x.deposit;
   if (!dep) throw new Error(`execution ${x.id}: refund leg without deposit or transfer`);
+  if (BigInt(dep.amount_in) <= 0n || (exactInput && BigInt(dep.amount_in) !== BigInt(leg.amount)))
+    throw mismatch(`deposit amount ${dep.amount_in}`);
   const d = i.destination_snapshot;
   const action = signAndSendAction({
     chain: d.chain,
@@ -618,12 +636,9 @@ async function nextActionOf(p: Payments, r: RefundRow, i: IntentRow, x: Executio
  * and the refund announces `requires_action`. A leg that is no longer `preparing` is applied like an
  * execution event instead.
  */
-async function linkLeg(p: Payments, legId: string, x: Execution, actor: string): Promise<void> {
-  const head = await p.db
-    .selectFrom("refund_legs")
-    .select(["refund_id"])
-    .where("id", "=", legId)
-    .executeTakeFirstOrThrow();
+async function linkLeg(p: Payments, legId: string, x: Execution, actor: string): Promise<"linked" | "mismatch"> {
+  const leg0 = await p.db.selectFrom("refund_legs").selectAll().where("id", "=", legId).executeTakeFirstOrThrow();
+  const head = { refund_id: leg0.refund_id };
   const r0 = await p.db.selectFrom("refunds").selectAll().where("id", "=", head.refund_id).executeTakeFirstOrThrow();
   const i0 = await p.db
     .selectFrom("payment_intents")
@@ -631,7 +646,19 @@ async function linkLeg(p: Payments, legId: string, x: Execution, actor: string):
     .where("id", "=", r0.payment_intent_id)
     .executeTakeFirstOrThrow();
   // the nonce/salt read happens before the transaction (no I/O under locks)
-  const na = await nextActionOf(p, r0, i0, x);
+  let na: Awaited<ReturnType<typeof nextActionOf>>;
+  try {
+    na = await nextActionOf(p, r0, i0, leg0, x);
+  } catch (e) {
+    if (!(e instanceof ExecutionMismatch)) throw e;
+    p.metrics.refund("execution_mismatch");
+    p.log.error(
+      { refund: r0.id, leg: leg0.number, execution: x.id, err: e.message },
+      "ALERT refund execution mismatch",
+    );
+    await failPreparation(p, r0.id, legId, "execution_mismatch", actor, x);
+    return "mismatch";
+  }
   await p.db.transaction().execute(async (tx) => {
     const l = await lockAll(tx, head.refund_id);
     if (!l) return;
@@ -674,10 +701,18 @@ async function linkLeg(p: Payments, legId: string, x: Execution, actor: string):
       actor,
     );
   });
+  return "linked";
 }
 
 /** A definitive preparation error: the leg fails, and so does the refund when it was its current leg. */
-async function failPreparation(p: Payments, refundId: string, legId: string, code: string, actor: string) {
+async function failPreparation(
+  p: Payments,
+  refundId: string,
+  legId: string,
+  code: string,
+  actor: string,
+  x?: Execution,
+) {
   await p.db.transaction().execute(async (tx) => {
     const l = await lockAll(tx, refundId);
     if (!l) return;
@@ -686,7 +721,12 @@ async function failPreparation(p: Payments, refundId: string, legId: string, cod
     const failed = await updateLeg(
       tx,
       leg,
-      { status: "failed", failure_code: code.slice(0, 64) },
+      {
+        status: "failed",
+        failure_code: code.slice(0, 64),
+        // a rejected execution stays linked: money that still moved through it is found (INV-3)
+        ...(x ? { execution_id: x.id, execution_version: x.version } : {}),
+      },
       {
         cause: `preparation failed: ${code}`,
         actor,
@@ -731,12 +771,14 @@ function prepareError(o: { code: string; message?: string; param?: string }): Ap
 export async function prepareAndReport(p: Payments, refundId: string, legId: string, actor: string) {
   const out = await callRails(p, refundId, legId);
   if (out.kind === "ok") {
+    let linked: "linked" | "mismatch" = "linked";
     try {
-      await linkLeg(p, legId, out.x, actor);
+      linked = await linkLeg(p, legId, out.x, actor);
     } catch (e) {
       // e.g. the live salt could not be read: the leg stays preparing and the recovery job retries
       p.log.warn({ refund: refundId, err: e instanceof Error ? e.message : String(e) }, "refund leg not linked yet");
     }
+    if (linked === "mismatch") throw prepareError({ code: "execution_mismatch" });
   } else if (out.kind === "definitive") {
     await failPreparation(p, refundId, legId, out.code, actor);
     p.metrics.refund(`rejected:${out.code}`);
@@ -890,7 +932,28 @@ async function applyLegChange(
 /** Applies a (newer) execution to a leg of a locked refund. */
 async function applyLegExecution(p: Payments, tx: Tx, l: Locked, leg: LegRow, x: Execution, actor: string) {
   if (x.version <= leg.execution_version) return;
-  const status = legStatusOf(x.state, x.evidence !== null, leg.status);
+  const { status, ignored } = legUpdateOf(x.state, x.evidence !== null, leg.status);
+  if (ignored) {
+    // a late state that would revive a leg that is over (e.g. the create response after a cancel or a
+    // recipient change, finding 6): the leg keeps its status and remembers the execution, so money that
+    // still moves through it is found and applied (INV-3). Rails has no route to abandon an execution
+    // (spec 0.2.0), so the leg records a note and the deposit instructions are never shown.
+    await updateLeg(
+      tx,
+      leg,
+      { execution_id: x.id, execution_version: x.version },
+      { cause: `execution ${x.id} v${x.version}: ${x.state} ignored (leg ${leg.status})`, actor },
+    );
+    await legTransition(tx, leg.id, leg.status, leg.status, {
+      cause: `late execution ${x.id} v${x.version} (${x.state}) ignored: the leg is ${leg.status}${leg.failure_code ? ` (${leg.failure_code})` : ""}; rails cannot abandon it (no route), nothing is shown to the merchant`,
+      actor,
+    });
+    p.log.warn(
+      { refund: l.refund.id, leg: leg.number, execution: x.id, state: x.state },
+      "late refund execution state ignored for a leg that is over",
+    );
+    return;
+  }
   const after = await updateLeg(
     tx,
     leg,
@@ -1040,7 +1103,8 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
 
   // signed Intents payload (sign_intent): exactly the issued payload, relayed as signed (INV-1)
   if (action.type !== "sign_intent") throw conflict("This leg is a chain transfer; report its `tx_hash`.");
-  if (leg0.status !== "awaiting_signature") throw conflict("A payload was already submitted for this leg.");
+  if (leg0.status !== "awaiting_signature" && leg0.status !== "submitting")
+    throw conflict("A payload was already submitted for this leg.");
   await assertRefundsAllowed(p, m.livemode);
   const issued = action as SignIntentAction;
   const v = verifySigned(body.signed_intent);
@@ -1049,6 +1113,23 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
     throw new ApiError("signed_intent_mismatch", {
       message: "Sign exactly the payload in next_action (same signer, nonce, transfer and deadline).",
     });
+  // the leg is `submitting` (under the row lock) before agentpay is called: a concurrent cancel or
+  // recipient change sees money that may be moving and refuses, so the reservation stays (finding 5)
+  await p.db.transaction().execute(async (tx) => {
+    const l = await lockAll(tx, r0.id);
+    const leg = l?.legs.find((g) => g.id === leg0.id);
+    if (!l || !leg || l.refund.status !== "requires_action" || l.refund.current_leg_id !== leg.id)
+      throw conflict("The refund changed meanwhile; its current leg does not take a submission.");
+    if (leg.status === "submitting") return; // a retry of a relay whose answer was lost
+    if (leg.status !== "awaiting_signature") throw conflict("A payload was already submitted for this leg.");
+    const after = await updateLeg(
+      tx,
+      leg,
+      { status: "submitting" },
+      { cause: "merchant-signed payload being relayed (agentpay)", actor: actor.id },
+    );
+    await updateRefund(tx, l.refund, {}, { cause: `leg ${after.number} payload being relayed`, actor: actor.id });
+  });
   try {
     await p.agentpay.relay({
       execution_id: leg0.execution_id as `ex_${string}`,
@@ -1060,23 +1141,38 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
   } catch (e) {
     const u = upstreamCode(e);
     const env = (e as { error?: { message?: string } }).error;
-    if (u.code === "intent_invalid" || u.code === "insufficient_balance" || u.code === "signed_intent_mismatch")
+    if (u.code === "intent_invalid" || u.code === "insufficient_balance" || u.code === "signed_intent_mismatch") {
+      // agentpay refused before publishing: nothing moved, the merchant may sign again
+      await settleRelay(p, r0.id, leg0.id, "awaiting_signature", `relay refused by agentpay: ${u.code}`, actor.id);
       throw new ApiError(u.code, { ...(env?.message ? { message: env.message } : {}) });
+    }
+    // unknown outcome (timeout, 5xx): the payload may have been published, so the leg stays `submitting`
+    // (cancel refused) until rails reports the execution or the merchant retries the same payload
+    p.log.warn(
+      { refund: r0.id, leg: leg0.number, reason: u.code },
+      "refund relay outcome unknown; leg stays submitting",
+    );
     throw new ApiError("rail_unavailable", { params: { reason: u.code ?? "relay unreachable" } });
   }
+  await settleRelay(p, r0.id, leg0.id, "submitted", "merchant-signed payload relayed (agentpay)", actor.id);
+  return viewOf(p, await ownRefund(p, m, id));
+}
+
+/** Ends a relay: the `submitting` leg becomes `submitted` (accepted) or `awaiting_signature` (refused). */
+async function settleRelay(
+  p: Payments,
+  refundId: string,
+  legId: string,
+  to: "submitted" | "awaiting_signature",
+  cause: string,
+  actor: string,
+): Promise<void> {
   await p.db.transaction().execute(async (tx) => {
-    const l = await lockAll(tx, r0.id);
-    const leg = l?.legs.find((g) => g.id === leg0.id);
-    if (!l || !leg || leg.status !== "awaiting_signature") return;
-    const after = await updateLeg(
-      tx,
-      leg,
-      { status: "submitted" },
-      {
-        cause: "merchant-signed payload relayed (agentpay)",
-        actor: actor.id,
-      },
-    );
+    const l = await lockAll(tx, refundId);
+    const leg = l?.legs.find((g) => g.id === legId);
+    // rails may already have moved the leg on (processing, …): its execution events win
+    if (!l || !leg || leg.status !== "submitting") return;
+    const after = await updateLeg(tx, leg, { status: to }, { cause, actor });
     await applyLegChange(
       p,
       tx,
@@ -1084,10 +1180,9 @@ export async function submitRefundTx(p: Payments, m: Merchant, id: string, body:
       leg,
       after,
       null,
-      actor.id,
+      actor,
     );
   });
-  return viewOf(p, await ownRefund(p, m, id));
 }
 
 /** `POST /v1/refunds/{id}/cancel` (§17 item 7). */

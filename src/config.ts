@@ -36,9 +36,14 @@ const shared = {
   pricingCurrencies: list(z.string().regex(/^[a-z]{3}$/)).default(["usd", "eur", "gbp", "chf", "jpy", "cad", "aud"]),
   /** NEAR RPC endpoints for the Verifier's `current_salt` (live refund legs signed from an Intents account). */
   nearRpcUrls: list(http()).default(["https://free.rpc.fastnear.com"]),
-  /** Anonymous payment-link sessions per IP per minute, and per link per minute (§6.2). */
+  /**
+   * Anonymous payment-link sessions per minute (§6.2, audit finding 3), counted by client network
+   * (/24 IPv4, /64 IPv6) across links, per link and client network, and a generous ceiling per link
+   * (session creation only; reads are never throttled by it). Shared through Valkey when configured.
+   */
   linkSessionsPerIp: bounded(1, 1_000, 10),
-  linkSessionsPerLink: bounded(1, 10_000, 60),
+  linkSessionsPerLinkClient: bounded(1, 1_000, 5),
+  linkSessionsPerLink: bounded(1, 100_000, 600),
   /** Payer attempts per IP per 10 minutes while Turnstile is unavailable (F-12). */
   turnstileOutageLimit: bounded(1, 1_000, 5),
 };

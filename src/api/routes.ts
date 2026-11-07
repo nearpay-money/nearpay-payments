@@ -77,6 +77,7 @@ import * as recon from "../app/reconciliation.js";
 import * as refunds from "../app/refunds.js";
 import { createSession, expireSession, getSession, listSessions, type Merchant } from "../app/sessions.js";
 import { listLines } from "../app/statement.js";
+import { clientIp } from "../domain/payment-link/rate-limit.js";
 import { openStream } from "../sse/stream.js";
 
 /** The account principal of a merchant route (secret/restricted key or dashboard session). */
@@ -91,11 +92,17 @@ const header = (ctx: RequestContext, name: string): string | undefined => {
   return (Array.isArray(v) ? v[0] : v) || undefined;
 };
 
-/** The payer's IP (first `X-Forwarded-For` hop, set by the gateway) and Cloudflare geo headers. */
-export function payerClient(ctx: RequestContext) {
-  const first = header(ctx, "x-forwarded-for")?.split(",")[0]?.trim();
+/**
+ * The payer's IP by identity's rule (L-ID-07, audit finding 3): `CF-Connecting-IP` on the server stage,
+ * the first `X-Forwarded-For` hop elsewhere; `unknown` when absent or malformed. Cloudflare geo headers.
+ */
+export function payerClient(p: Payments, ctx: RequestContext) {
+  const ip = clientIp(p.env, {
+    cfConnectingIp: header(ctx, "cf-connecting-ip"),
+    xForwardedFor: header(ctx, "x-forwarded-for"),
+  });
   return {
-    ip: (first || ctx.request.ip || "unknown").slice(0, 64),
+    ip: ip ?? "unknown",
     country: header(ctx, "cf-ipcountry") ?? null,
     region: header(ctx, "cf-region-code") ?? null,
   };
@@ -138,7 +145,8 @@ export function paymentsRoutes(p: Payments): RouteBinding[] {
     implement(listPaymentOptions, async (ctx) => paymentOptions(p, ctx.params.id, secretOf(ctx), ctx.query) as never),
     implement(
       createPaymentAttempt,
-      async (ctx) => attempts.createPayerAttempt(p, ctx.params.id, secretOf(ctx), ctx.body, payerClient(ctx)) as never,
+      async (ctx) =>
+        attempts.createPayerAttempt(p, ctx.params.id, secretOf(ctx), ctx.body, payerClient(p, ctx)) as never,
     ),
     implement(submitDepositTx, async (ctx) => {
       await attempts.submitDepositTx(p, ctx.params.id, ctx.params.attempt, secretOf(ctx), ctx.body.tx_hash);
@@ -213,7 +221,7 @@ export function paymentsRoutes(p: Payments): RouteBinding[] {
     implement(getPublicPaymentLink, async (ctx) => links.getPublicLink(p, ctx.params.id) as never),
     implement(
       createPaymentLinkSession,
-      async (ctx) => links.createLinkSession(p, ctx.params.id, ctx.body, payerClient(ctx).ip) as never,
+      async (ctx) => links.createLinkSession(p, ctx.params.id, ctx.body, payerClient(p, ctx).ip) as never,
     ),
 
     // ---- stage 2: customers

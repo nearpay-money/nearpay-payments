@@ -27,10 +27,11 @@
     "@nearpay-internal/db": "0.1.2",
     "@nearpay-internal/http": "0.1.2",
     "@nearpay-internal/ids": "0.1.2",
+    "@nearpay-internal/intents": "0.1.2",
     "@nearpay-internal/money": "0.1.2",
     "@nearpay-internal/service": "0.1.2",
-    "@nearpay-internal/spec": "0.1.5",
-    "@nearpay/spec": "0.1.5",
+    "@nearpay-internal/spec": "0.2.0",
+    "@nearpay/spec": "0.2.0",
     "canonicalize": "5.1.0",
     "ioredis": "6.0.0",
     "kysely": "0.29.8",
@@ -48,8 +49,8 @@
   },
   "pnpm": {
     "overrides": {
-      "@nearpay/spec": "0.1.5",
-      "@nearpay-internal/spec": "0.1.5"
+      "@nearpay/spec": "0.2.0",
+      "@nearpay-internal/spec": "0.2.0"
     },
     "onlyBuiltDependencies": [
       "esbuild",

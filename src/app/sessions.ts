@@ -11,6 +11,7 @@ import { ApiError } from "@nearpay-internal/service";
 import { originsProblem, sessionTtl } from "../domain/checkout-session/session.js";
 import { isAttemptStatus } from "../domain/payment-attempt/attempt.js";
 import { canExpire, onSessionDeadline } from "../domain/payment-intent/intent.js";
+import { acceptsPayers, RESERVING_INTENT_STATUSES } from "../domain/payment-link/link.js";
 import type { DestinationSnapshotJson } from "../infra/db/schema.js";
 import type { Payments, Tx } from "./context.js";
 import {
@@ -90,6 +91,44 @@ export async function attachableCustomer(p: Payments, m: Merchant, id: string | 
 }
 
 /**
+ * A session opened from a payment link reserves one of its uses (audit finding 12): under the link's row
+ * lock, `uses` + intents of the link that can still succeed must stay below `max_uses`. Concurrent
+ * session creations serialise on the lock; a reservation ends with its intent (succeeded → a use;
+ * canceled or expired → released), so nothing has to be given back explicitly.
+ */
+async function reserveLinkUse(tx: Tx, m: Merchant, linkId: string): Promise<void> {
+  const l = await tx
+    .selectFrom("payment_links")
+    .select(["active", "uses", "max_uses"])
+    .where("id", "=", linkId)
+    .where("account_id", "=", m.account)
+    .where("livemode", "=", m.livemode)
+    .forUpdate()
+    .executeTakeFirst();
+  if (!l) throw ApiError.missing("payment_link", fromUuid("plink", linkId));
+  let reserved = 0;
+  if (l.max_uses !== null) {
+    const r = await tx
+      .selectFrom("payment_intents")
+      .select((eb) => eb.fn.countAll<string>().as("n"))
+      .where("payment_link_id", "=", linkId)
+      .where("account_id", "=", m.account)
+      .where("livemode", "=", m.livemode)
+      .where("status", "in", [...RESERVING_INTENT_STATUSES])
+      .executeTakeFirstOrThrow();
+    reserved = Number(r.n);
+  }
+  if (!acceptsPayers({ active: l.active, uses: l.uses, maxUses: l.max_uses }, reserved))
+    throw new ApiError("link_inactive", {
+      message: !l.active
+        ? "This payment link is no longer active."
+        : l.uses >= (l.max_uses as number)
+          ? "This payment link has reached its usage limit."
+          : "Every remaining use of this payment link is held by a checkout in progress; try again later.",
+    });
+}
+
+/**
  * Opens a checkout session and its intent (§8.1): validates the price, snapshots destination, fee
  * schedule + bearer and settings (INV-6) and schedules `session.expire`, in one transaction.
  */
@@ -125,6 +164,7 @@ export async function openSession(p: Payments, m: Merchant, body: SessionSpec): 
   const expiresAt = new Date(now + ttl * 1000);
 
   const { s, i } = await p.db.transaction().execute(async (tx) => {
+    if (body.paymentLinkId) await reserveLinkUse(tx, m, body.paymentLinkId);
     const i0 = await tx
       .insertInto("payment_intents")
       .values({

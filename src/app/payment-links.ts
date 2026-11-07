@@ -1,13 +1,14 @@
 /**
  * Payment links (lld/payments.md §6.1–§6.2, §17 item 11). Merchants create, read, list and PATCH links
  * (pricing immutable, INV-6; deactivate instead of delete). Payers read a link and open a checkout
- * session from it anonymously (`GET|POST /v1/payment_links/{id}/public/**`, per-IP and per-link rate
- * limits); the session is `source: payment_link` with the link's metadata, and the checkout continues
+ * session from it anonymously (`GET|POST /v1/payment_links/{id}/public/**`; session creation is rate
+ * limited per client network, per link and client network, and per link, in Valkey); the session is `source: payment_link` with the link's metadata, and the checkout continues
  * exactly like `/c/:id` (attempts stay Turnstile-protected). Links emit no events in v1.
  */
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import { acceptsPayers } from "../domain/payment-link/link.js";
+import { ipPrefix, type Limit } from "../domain/payment-link/rate-limit.js";
 import type { Payments } from "./context.js";
 import { type PageQuery, pageOf } from "./pages.js";
 import { merchantName } from "./payer.js";
@@ -154,40 +155,42 @@ export async function getPublicLink(p: Payments, id: string) {
   };
 }
 
-// sliding-window limits per replica (the gateway adds its own per-IP limit)
-const windows = new Map<string, number[]>();
 const WINDOW_MS = 60_000;
 
-function limit(p: Payments, key: string, max: number): void {
-  const now = p.now();
-  const recent = (windows.get(key) ?? []).filter((t) => now - t < WINDOW_MS);
-  if (recent.length >= max) {
-    const retry = Math.max(1, Math.ceil(((recent[0] as number) + WINDOW_MS - now) / 1000));
-    throw new ApiError("rate_limited", { params: { retry_after: retry }, headers: { "Retry-After": String(retry) } });
-  }
-  recent.push(now);
-  windows.set(key, recent);
-  if (windows.size > 50_000) windows.delete(windows.keys().next().value as string);
+/** The anonymous session limits (§6.2, finding 3), in the order they are reported. */
+export function linkLimits(p: Payments, link: LinkRow, ip: string): Limit[] {
+  const client = ipPrefix(ip === "unknown" ? null : ip);
+  const mode = link.livemode ? "live" : "test";
+  return [
+    { key: `plink:ip:${client}`, max: p.settings.linkSessionsPerIp },
+    { key: `plink:${mode}:${link.id}:${client}`, max: p.settings.linkSessionsPerLinkClient },
+    // generous ceiling for the whole link: throttles session creation only, never reads
+    { key: `plink:${mode}:${link.id}`, max: p.settings.linkSessionsPerLink },
+  ];
 }
 
-/** For tests: forget the rate-limit windows. */
-export function resetLinkLimits(): void {
-  windows.clear();
-}
-
-/** `POST /v1/payment_links/{id}/public/sessions`. */
+/**
+ * `POST /v1/payment_links/{id}/public/sessions`. The link is validated (exists, accepts payers) before
+ * anything is counted, so unknown or inactive ids cost no client a slot; then the per-client-network,
+ * per-link-and-client-network and per-link limits; `max_uses` is enforced atomically when the session
+ * is opened (finding 12). The session is opened in the link's own account and mode.
+ */
 export async function createLinkSession(
   p: Payments,
   id: string,
   body: { customer_email?: string | undefined; locale?: string | undefined },
   ip: string,
 ) {
-  limit(p, `ip:${ip}`, p.settings.linkSessionsPerIp);
-  limit(p, `link:${id}`, p.settings.linkSessionsPerLink);
   const l = await publicRow(p, id);
   if (!acceptsPayers({ active: l.active, uses: l.uses, maxUses: l.max_uses }))
     throw new ApiError("link_inactive", {
       message: l.active ? "This payment link has reached its usage limit." : "This payment link is no longer active.",
+    });
+  const t = await p.limiter.take(linkLimits(p, l, ip), p.now(), WINDOW_MS);
+  if (!t.ok)
+    throw new ApiError("rate_limited", {
+      params: { retry_after: t.retryAfter },
+      headers: { "Retry-After": String(t.retryAfter) },
     });
   const plink = fromUuid("plink", l.id);
   const o = await openSession(

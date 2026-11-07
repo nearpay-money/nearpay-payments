@@ -16,6 +16,8 @@ export type RefundStatus = "requires_action" | "pending" | "succeeded" | "failed
 export type LegStatus =
   | "preparing"
   | "awaiting_signature"
+  /** Internal (shown as `submitted`): the merchant-signed payload is being relayed (agentpay). */
+  | "submitting"
   | "submitted"
   | "processing"
   | "succeeded"
@@ -105,21 +107,51 @@ export const legIdempotencyKey = (refundId: string, leg: number) => `refund:${re
 
 // ------------------------------------------------------------------------------------------- legs
 
-/** The merchant's money may be moving through this leg (blocks cancel, prepare and recipient changes). */
-export const MONEY_MOVING: ReadonlySet<LegStatus> = new Set(["submitted", "processing", "held"]);
+/**
+ * The merchant's money may be moving through this leg (blocks cancel, prepare and recipient changes).
+ * `submitting` is set under the row lock before the relay call, so a cancel racing the relay cannot
+ * release the reservation while the payload is on its way (audit finding 5).
+ */
+export const MONEY_MOVING: ReadonlySet<LegStatus> = new Set(["submitting", "submitted", "processing", "held"]);
 /** Nothing more happens through this leg. `expired` is not final: a late deposit may still settle. */
 export const LEG_TERMINAL: ReadonlySet<LegStatus> = new Set(["succeeded", "returned", "failed"]);
 
 const LEG_IN_FLIGHT = new Set(["deposit_detected", "incomplete_deposit", "settling", "verifying"]);
 
+/** Leg statuses that mean money moved (or may have) through the execution. */
+const MONEY_MOVED: ReadonlySet<LegStatus> = new Set(["processing", "succeeded", "returned", "held"]);
+
 /**
- * The leg status for an execution state. A success without evidence is `held` (INV-2); anything
- * unknown is `held` (never assumed terminal). A leg the merchant already submitted stays `submitted`
- * until the execution shows the deposit.
+ * The leg status for an execution state, and whether the state was ignored. A success without evidence
+ * is `held` (INV-2); anything unknown is `held` (never assumed terminal). A leg the merchant already
+ * submitted (or whose payload is being relayed) stays so until the execution shows the deposit.
+ *
+ * A leg that is over (`failed` — preparation failed, canceled, superseded — `succeeded`, `returned`)
+ * follows only money that moved (`processing`, `succeeded`, `returned`, `held`, truth wins INV-3);
+ * any other state (e.g. a late create response `awaiting_deposit` after a cancel) is ignored instead
+ * of reviving the leg (audit finding 6).
  */
+export function legUpdateOf(
+  state: string,
+  hasEvidence: boolean,
+  current: LegStatus,
+): { status: LegStatus; ignored: boolean } {
+  const next = mappedLegStatus(state, hasEvidence, current);
+  if (next === current) return { status: next, ignored: false };
+  if (LEG_TERMINAL.has(current) && !MONEY_MOVED.has(next)) return { status: current, ignored: true };
+  // a deposit was seen (or the leg is over): a pre-deposit state never takes it back
+  if (next === "awaiting_signature" && current !== "preparing" && current !== "awaiting_signature")
+    return { status: current, ignored: true };
+  return { status: next, ignored: false };
+}
+
 export function legStatusOf(state: string, hasEvidence: boolean, current: LegStatus): LegStatus {
+  return legUpdateOf(state, hasEvidence, current).status;
+}
+
+function mappedLegStatus(state: string, hasEvidence: boolean, current: LegStatus): LegStatus {
   if (state === "quoting" || state === "awaiting_deposit")
-    return current === "submitted" ? "submitted" : "awaiting_signature";
+    return current === "submitted" || current === "submitting" ? current : "awaiting_signature";
   if (LEG_IN_FLIGHT.has(state)) return "processing";
   if (state === "succeeded") return hasEvidence ? "succeeded" : "held";
   if (state === "refunded") return "returned";
@@ -166,6 +198,8 @@ const none = (cause: string): RefundDecision => ({
 export function onLegChange(refund: RefundState, leg: LegChange, others: readonly LegStatus[]): RefundDecision {
   const { from, to } = leg;
   if (to === from) return none("no leg status change");
+  // the relay is in progress: the refund waits for its answer (submitted, or back to awaiting_signature)
+  if (to === "submitting") return none(`leg ${leg.id} payload being relayed`);
   const st = refund.status;
 
   if (to === "succeeded") {
@@ -238,7 +272,7 @@ export function canCancel(
 ): ActionError | null {
   if (status !== "requires_action") return "state_conflict";
   if (!conflictFree(legs)) return "state_conflict";
-  if (current?.submittedTx) return "state_conflict";
+  if (current?.submittedTx || current?.status === "submitting") return "state_conflict";
   return null;
 }
 
@@ -269,11 +303,16 @@ export function prepareMode(
   return "state_conflict";
 }
 
-/** `POST /v1/refunds/{id}/submit_tx`: the current leg must be awaiting its signature and still open. */
+/**
+ * `POST /v1/refunds/{id}/submit_tx`: the current leg must be awaiting its signature and still open.
+ * `submitting` (a relay whose answer was lost) takes the same signed payload again: its nonce makes a
+ * second relay harmless.
+ */
 export function canSubmit(status: RefundStatus, current: CurrentLeg | null, now: number): ActionError | null {
   if (status !== "requires_action" || !current) return "state_conflict";
   if (current.status === "expired") return "leg_expired";
-  if (current.status !== "awaiting_signature" && current.status !== "submitted") return "state_conflict";
+  if (current.status !== "awaiting_signature" && current.status !== "submitted" && current.status !== "submitting")
+    return "state_conflict";
   if (!current.deadline || current.deadline.getTime() <= now) return "leg_expired";
   return null;
 }

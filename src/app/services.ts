@@ -56,8 +56,10 @@ import { type Turnstile, turnstileClient, turnstileDisabled } from "../infra/cli
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
 import type { DB } from "../infra/db/schema.js";
 import { type Notifier, notifier } from "../infra/notifier.js";
+import { memoryLimiter, type RateLimiter, rateLimiter } from "../infra/rate-limiter.js";
 import { jobHandlers, RECURRING } from "../workers/jobs.js";
 import { newCaches, noMetrics, type Payments, paymentsMetrics } from "./context.js";
+import { reportKillSwitchAtBoot } from "./kill-switch.js";
 
 export interface ServiceDeps {
   database?: Database<DB>;
@@ -70,6 +72,7 @@ export interface ServiceDeps {
   sandbox?: Sandbox | null;
   turnstile?: Turnstile;
   notifier?: Notifier;
+  limiter?: RateLimiter;
   ticketKey?: KeyObject;
   cipher?: EnvelopeCipher;
   nonces?: Nonces;
@@ -124,6 +127,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
           })
         : turnstileDisabled),
     notifier: deps.notifier ?? notifier(config.valkeyUrl),
+    limiter: deps.limiter ?? rateLimiter(config.valkeyUrl),
     ticketKey: deps.ticketKey ?? createPrivateKey(config.ticketSigningKey),
     cipher: deps.cipher ?? createEnvelopeCipher(parseKek(config.piiKek)),
     // a separate key for the email lookup hash, derived from the KEK (never the KEK itself)
@@ -137,6 +141,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
       turnstileOutageLimit: config.turnstileOutageLimit,
       linkSessionsPerIp: config.linkSessionsPerIp,
       linkSessionsPerLink: config.linkSessionsPerLink,
+      linkSessionsPerLinkClient: config.linkSessionsPerLinkClient,
     },
     caches: newCaches(deps.now),
     random: deps.random ?? Math.random,
@@ -163,6 +168,7 @@ function attach(b: Built, service: Service, deps: ServiceDeps) {
   b.payments.metrics = paymentsMetrics(service.metrics);
   service.onShutdown(async () => {
     if (!deps.notifier) await b.payments.notifier.close();
+    if (!deps.limiter) await b.payments.limiter.close();
     if (!deps.database) await b.database.close();
   });
 }
@@ -173,12 +179,13 @@ export function createOpsContext(
   log: Payments["log"],
   deps: ServiceDeps = {},
 ): { payments: Payments; close(): Promise<void> } {
-  const b = build(config, { notifier: notifier(undefined), ...deps }, "ops");
+  const b = build(config, { notifier: notifier(undefined), limiter: memoryLimiter(), ...deps }, "ops");
   b.payments.log = log;
   return {
     payments: b.payments,
     async close() {
       await b.payments.notifier.close();
+      await b.payments.limiter.close();
       if (!deps.database) await b.database.close();
     },
   };
@@ -212,6 +219,11 @@ export async function createWorker(
   const service = createService({ name: "payments", config, readiness: readiness(b) });
   attach(b, service, deps);
   const db = b.database;
+  // sentinel's state cannot be read at boot (no service route in spec 0.2.0): an unknown state keeps live
+  // refunds paused until the consumer applies `evt.sentinel.kill_switch.*` (finding 8)
+  await reportKillSwitchAtBoot(p).catch((e: unknown) =>
+    service.log.warn({ err: e instanceof Error ? e.message : String(e) }, "kill switch state not read at boot"),
+  );
 
   const bus = deps.bus ?? (await connectBus({ url: config.natsUrl, name: `payments-worker@${hostname()}` }));
   await ensureStreams(bus, [STREAMS.payments]);

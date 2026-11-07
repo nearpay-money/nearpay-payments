@@ -3,8 +3,9 @@
  * (timeout, 5xx, open breaker) is reported as `unavailable`: the attempt proceeds under a stricter
  * per-IP limit (F-12) instead of blocking every payer.
  *
- * Cloudflare's documented test secrets behave deterministically, so outside the server stage they
- * are answered locally, as identity does (identity LLD §11): `1x…AA` always passes, `2x…AA` always
+ * Cloudflare's documented test secrets behave deterministically, so on the `local` and `test` stages
+ * only (an allow-list: any other stage asks siteverify, audit finding 2) they are answered locally, as
+ * identity does (identity LLD §11): `1x…AA` always passes, `2x…AA` always
  * fails, `3x…AA` reports a spent token. The local stack then needs no egress to Cloudflare, and an
  * offline machine does not fall into the outage limit after five attempts.
  */
@@ -28,12 +29,12 @@ export const TEST_SECRETS: Readonly<Record<string, TurnstileResult>> = {
 
 export function turnstileClient(o: {
   secret: string;
-  /** `NP_ENV`: test secrets are answered locally except on the server. */
-  env: "local" | "server" | "test";
+  /** `NP_ENV`: test secrets are answered locally on `local` and `test` only. */
+  env: string;
   baseUrl?: string;
   fetch?: typeof fetch;
 }): Turnstile {
-  if (o.env !== "server" && Object.hasOwn(TEST_SECRETS, o.secret)) {
+  if ((o.env === "local" || o.env === "test") && Object.hasOwn(TEST_SECRETS, o.secret)) {
     const result = TEST_SECRETS[o.secret] as TurnstileResult;
     return { verify: async () => result };
   }

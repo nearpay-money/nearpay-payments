@@ -1,4 +1,5 @@
 /** Dependencies shared by payments use cases. */
+
 import type { KeyObject } from "node:crypto";
 import type { EnvelopeCipher, Kysely, Transaction } from "@nearpay-internal/db";
 import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
@@ -15,6 +16,7 @@ import type {
 import type { Turnstile } from "../infra/clients/turnstile.js";
 import type { DB } from "../infra/db/schema.js";
 import type { Notifier } from "../infra/notifier.js";
+import type { RateLimiter } from "../infra/rate-limiter.js";
 import { type TtlCache, ttlCache } from "./cache.js";
 
 export type Tx = Transaction<DB>;
@@ -81,6 +83,7 @@ export interface PaymentsSettings {
   /** Anonymous payment-link sessions per IP / per link per minute. */
   readonly linkSessionsPerIp: number;
   readonly linkSessionsPerLink: number;
+  readonly linkSessionsPerLinkClient: number;
   /** Test treasury / live treasury are rails' business; payments only forwards. */
 }
 
@@ -111,6 +114,8 @@ export interface Payments {
   readonly sandbox: Sandbox | null;
   readonly turnstile: Turnstile;
   readonly notifier: Notifier;
+  /** Anonymous payment-link rate limits (Valkey, in-process fallback). */
+  readonly limiter: RateLimiter;
   /** Payments' attestation-ticket key (Ed25519, public key configured in sentinel). */
   readonly ticketKey: KeyObject;
   /** PII envelope cipher (customer email). */

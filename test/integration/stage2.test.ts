@@ -916,6 +916,27 @@ describe("reconciliation (console)", () => {
     ).rejects.toThrow();
   });
 
+  it("reconcile.daily schedules one run per active account; the scheduled run waits for a complete rails day", async () => {
+    const paid = await paidIntent();
+    const day = yesterday().toISOString().slice(0, 10);
+    const p = st.worker?.payments as NonNullable<typeof st.worker>["payments"];
+    const { jobHandlers } = await import("../../src/workers/jobs.js");
+    const { scheduleDaily, runJob } = await import("../../src/app/reconciliation.js");
+    expect(await scheduleDaily(p, day)).toBeGreaterThan(0);
+    const acct = uuid(paid.m.account, "acct");
+    st.evidenceDay.complete = false;
+    await expect(runJob(p, { account: acct, livemode: false, day }, 1)).rejects.toThrow(/not complete/);
+    st.evidenceDay.complete = true;
+    await runJob(p, { account: acct, livemode: false, day }, 1);
+    const runs = await st.call("GET", `/ops/reconciliation_runs?account=${paid.m.account}&day=${day}`, {
+      token: await st.opsToken(),
+    });
+    expect(runs.body.data[0]).toMatchObject({ trigger: "schedule", status: "ok", diff_count: 0 });
+    expect(Object.keys(jobHandlers(p))).toEqual(
+      expect.arrayContaining(["reconcile.daily", "reconcile.run", "reconcile.case", "refund.prepare_recovery"]),
+    );
+  });
+
   it("refuses open days, merchant tokens, and non-ops principals", async () => {
     const m = st.merchant();
     const ops = await st.opsToken();

@@ -68,21 +68,23 @@ node dist/main.js api|worker|migrate|healthcheck
 
 ## Configuration
 
-| Variable                                                                  | Default                         | Meaning                                                                 |
-| ------------------------------------------------------------------------- | ------------------------------- | ----------------------------------------------------------------------- |
-| `NP_DB_URL_FILE`                                                          | —                               | app-role database URL (migrate: migrator role)                          |
-| `NP_IDENTITY_URL`, `NP_RAILS_URL`, `NP_AGENTPAY_URL`, `NP_COMPLIANCE_URL` | —                               | peers (§10 timeouts)                                                    |
-| `NP_SANDBOX_BASE_URL`                                                     | unset                           | test mode: simulated deposits and `advance`                             |
-| `NP_SERVICE_CLIENT_SECRET_FILE`                                           | —                               | client credentials for service tokens                                   |
-| `NP_TICKET_SIGNING_KEY_FILE`                                              | —                               | Ed25519 PEM for attestation tickets (public key configured in sentinel) |
-| `NP_PII_KEK_FILE`                                                         | —                               | 32-byte KEK for customer email encryption                               |
-| `NP_TURNSTILE_SECRET_FILE`                                                | unset                           | Turnstile siteverify; unset (local/test only) disables the challenge    |
-| `NP_PAY_ORIGIN`                                                           | `https://pay.nearpay.localhost` | checkout origin of session URLs                                         |
-| `NP_VALKEY_URL`                                                           | unset                           | payer-stream fan-out across api replicas                                |
-| `NP_NATS_URL`                                                             | —                               | worker: domain events                                                   |
-| `NP_MAX_LIVE_ATTEMPTS`                                                    | 5                               | live attempts per session                                               |
-| `NP_UNDERPAY_TOLERANCE_MAX_BPS`                                           | 100                             | ceiling on the account's underpay tolerance                             |
-| `NP_PRICING_CURRENCIES`                                                   | `usd`                           | fiat pricing currencies (Stage 1)                                       |
+| Variable                                                                  | Default                         | Meaning                                                                                |
+| ------------------------------------------------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------- |
+| `NP_DB_URL_FILE`                                                          | —                               | app-role database URL (migrate: migrator role)                                         |
+| `NP_IDENTITY_URL`, `NP_RAILS_URL`, `NP_AGENTPAY_URL`, `NP_COMPLIANCE_URL` | —                               | peers (§10 timeouts)                                                                   |
+| `NP_SANDBOX_BASE_URL`                                                     | unset                           | test mode: simulated deposits and `advance`                                            |
+| `NP_SERVICE_CLIENT_SECRET_FILE`                                           | —                               | client credentials for service tokens                                                  |
+| `NP_TICKET_SIGNING_KEY_FILE`                                              | —                               | Ed25519 PEM for attestation tickets (public key configured in sentinel)                |
+| `NP_PII_KEK_FILE`                                                         | —                               | 32-byte KEK for customer email encryption                                              |
+| `NP_TURNSTILE_SECRET_FILE`                                                | unset                           | Turnstile siteverify; unset (local/test only) disables the challenge                   |
+| `NP_PAY_ORIGIN`                                                           | `https://pay.nearpay.localhost` | checkout origin of session URLs                                                        |
+| `NP_VALKEY_URL`                                                           | unset                           | payer-stream fan-out across api replicas                                               |
+| `NP_NATS_URL`                                                             | —                               | worker: domain events                                                                  |
+| `NP_MAX_LIVE_ATTEMPTS`                                                    | 5                               | live attempts per session                                                              |
+| `NP_UNDERPAY_TOLERANCE_MAX_BPS`                                           | 100                             | ceiling on the account's underpay tolerance                                            |
+| `NP_PRICING_CURRENCIES`                                                   | `usd,eur,gbp,chf,jpy,cad,aud`   | fiat pricing currencies payments accepts; rails FX rates decide availability (Stage 2) |
+| `NP_NEAR_RPC_URLS`                                                        | `https://free.rpc.fastnear.com` | Verifier `current_salt` for live refund payloads signed from an Intents account        |
+| `NP_LINK_SESSIONS_PER_IP`, `NP_LINK_SESSIONS_PER_LINK`                    | 10, 60                          | anonymous payment-link sessions per minute (per replica)                               |
 
 ## Behaviour (Stage 1)
 
@@ -92,13 +94,29 @@ node dist/main.js api|worker|migrate|healthcheck
 - **Statement**: one line per paying/overpaying attempt (`bt_once`), with evidence, at `GET /v1/balance_transactions`.
 - **Payer stream**: SSE snapshots on every change (Valkey `cs:<uuid>` after commit) plus a 5 s re-check.
 
+## Behaviour (Stage 2)
+
+- **Refunds** (`re_`): legs are rails refund executions (`POST /internal/refund_executions`, key `refund:<re>:leg:<n>`);
+  the merchant signs `next_action` (`sign_and_send`, or a `sign_intent` Verifier transfer payments builds with a fresh
+  nonce); `submit_tx` forwards a tx hash to rails or relays the exact signed payload through agentpay (`kind: refund`).
+  Success only on payer-side evidence; duplicate legs and late successes beyond the budget go to `extra_amount_sent`, so
+  refunded + pending never exceeds settled (intent budget, or the attempt's for overpayments / rejected short
+  settlements). Transient rail failures leave the leg `preparing` for `refund.prepare_recovery`. While sentinel's kill
+  switch is engaged no new live leg is prepared and no live payload relayed.
+- **Payment links** (`plink_`), **customers** (`cus_`, encrypted PII, DELETE erases), `POST /v1/payment_intents`
+  (headless session, client secret once), ADR-0018 list filters, review accept/reject (reject drafts a refund).
+- **Reconciliation**: `reconcile.daily` (02:00 UTC) → `reconcile.run` per account/mode/day against rails evidence
+  summary + pages; append-only runs on `/ops/reconciliation_runs…`; `diff`/`error` opens a compliance
+  `reconciliation_diff` case; console writes publish `evt.payments.ops_action.recorded`.
+
 ## Ops CLI (Stage 1)
 
 `docker compose -p nearpay exec payments-api /nodejs/bin/node dist/ops.js <command>`: `intent <pi_…>`, `session <cs_…>`, `attempt-recover <pa_…>`, `context-refresh <acct_…> [--live]`, `stuck`.
 
 ## Status
 
-Stage 1 implemented (step 1.2): every Stage-1 route of the spec, the 14 consumed subjects, the 10 produced ones. Stage 2 (refunds, payment links, customers, review decisions, reconciliation) is not started.
+Stage 1 implemented (step 1.2). Stage 2 implemented (step 2.2, spec 0.2.0, kit 0.2.0): every stage ≤ 2 route of the
+spec including the `/ops` console routes, the 16 consumed subjects, the 17 produced ones.
 
 ## Built with
 

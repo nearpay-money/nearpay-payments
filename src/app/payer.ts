@@ -3,12 +3,13 @@
  * options. Authenticated by the client secret only; never PII, never the raw destination address. The
  * merchant name here is unverified display data — the co-signed name comes from sentinel (ADR-0010).
  */
+import { fromUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import { type Pricing, settlementEstimate } from "../domain/pricing/pricing.js";
 import { type InternalOption, upstreamCode } from "../infra/clients/peers.js";
 import { payerSession, payerView } from "./attempts.js";
 import type { Payments } from "./context.js";
-import { assetInfo } from "./sessions.js";
+import { assetInfo, railsSettlementEstimate } from "./pricing.js";
 import { settlementContext } from "./settlement-context.js";
 import { type AttemptRow, type IntentRow, newestFirst, publicSession, type SessionRow } from "./views.js";
 
@@ -46,6 +47,19 @@ export async function getPublicSession(p: Payments, sessionId: string, secret: s
   return (await publicSnapshot(p, s, i)).session;
 }
 
+/**
+ * `GET /internal/checkout_sessions/{id}/payer` (agentpay, CR-15-15): verifies the payer's client secret
+ * exactly like the public route and adds the session's account and mode.
+ */
+export async function getPayerSession(p: Payments, sessionId: string, secret: string | undefined) {
+  const { s, i } = await payerSession(p, sessionId, secret);
+  return {
+    account_id: fromUuid("acct", s.account_id),
+    livemode: s.livemode,
+    session: (await publicSnapshot(p, s, i)).session,
+  };
+}
+
 const REASONS = new Set(["route_too_slow", "amount_too_low", "route_unavailable", "pricing_unavailable"]);
 type Reason = "route_too_slow" | "amount_too_low" | "route_unavailable" | "pricing_unavailable";
 
@@ -70,6 +84,8 @@ export function payerOption(o: InternalOption, remainingS: number, latePayments:
     min_deadline_s: o.min_deadline_s,
     available: o.available && !tooSlow,
     reason,
+    // CR-15-06: the token contract to pay with, passed through from rails
+    token: o.token ?? null,
   };
 }
 
@@ -93,7 +109,10 @@ export async function paymentOptions(
       ? { kind: "asset", assetId: i.pricing_asset_id as string, amount: BigInt(i.pricing_asset_amount as string) }
       : { kind: "fiat", currency: i.currency, amount: BigInt(i.amount as string) };
   let amountOut: bigint | null;
-  try {
+  if (pricing.kind === "fiat" && pricing.currency !== "usd")
+    // non-USD prices are valued by rails (FX, ADR-0020 d5); no estimate → no options (manual path)
+    amountOut = await railsSettlementEstimate(p, pricing, d.asset_id, i.livemode);
+  else try {
     const dest = await assetInfo(p, d.asset_id, i.livemode);
     const pa =
       pricing.kind === "asset" && pricing.assetId !== d.asset_id

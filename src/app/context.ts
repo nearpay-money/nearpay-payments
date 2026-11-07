@@ -11,6 +11,7 @@ import type {
   Rails,
   Sandbox,
 } from "../infra/clients/peers.js";
+import type { Nonces } from "../infra/clients/near.js";
 import type { Turnstile } from "../infra/clients/turnstile.js";
 import type { DB } from "../infra/db/schema.js";
 import type { Notifier } from "../infra/notifier.js";
@@ -24,9 +25,18 @@ export interface PaymentsMetrics {
   overpayment(reason: string): void;
   review(reason: string): void;
   timeToSuccess(routeClass: string, seconds: number): void;
+  refund(outcome: string): void;
+  reconciliation(status: string, diffs: number): void;
 }
 
-export const noMetrics: PaymentsMetrics = { attempt() {}, overpayment() {}, review() {}, timeToSuccess() {} };
+export const noMetrics: PaymentsMetrics = {
+  attempt() {},
+  overpayment() {},
+  review() {},
+  timeToSuccess() {},
+  refund() {},
+  reconciliation() {},
+};
 
 export function paymentsMetrics(m: ServiceMetrics): PaymentsMetrics {
   const attempts = m.counter("attempts_total", "Payment attempts by method, route class and outcome.", [
@@ -42,7 +52,17 @@ export function paymentsMetrics(m: ServiceMetrics): PaymentsMetrics {
     ["route_class"],
     [10, 30, 60, 120, 300, 600, 1800, 3600],
   );
+  const refunds = m.counter("refunds_total", "Refund outcomes (created, succeeded, failed, canceled, duplicate_leg).", [
+    "outcome",
+  ]);
+  const runs = m.counter("reconciliation_runs_total", "Reconciliation runs by final status.", ["status"]);
+  const diffs = m.counter("reconciliation_diffs_total", "Reconciliation differences found (target: zero).", []);
   return {
+    refund: (outcome) => refunds.inc({ outcome }),
+    reconciliation: (status, n) => {
+      runs.inc({ status });
+      if (n > 0) diffs.inc(n);
+    },
     attempt: (method, routeClass, outcome) => attempts.inc({ method, route_class: routeClass, outcome }),
     overpayment: (reason) => over.inc({ reason }),
     review: (reason) => review.inc({ reason }),
@@ -58,6 +78,9 @@ export interface PaymentsSettings {
   readonly pricingCurrencies: ReadonlySet<string>;
   /** Payer attempts per IP per 10 minutes while Turnstile is unavailable (F-12). */
   readonly turnstileOutageLimit: number;
+  /** Anonymous payment-link sessions per IP / per link per minute. */
+  readonly linkSessionsPerIp: number;
+  readonly linkSessionsPerLink: number;
   /** Test treasury / live treasury are rails' business; payments only forwards. */
 }
 
@@ -92,6 +115,10 @@ export interface Payments {
   readonly ticketKey: KeyObject;
   /** PII envelope cipher (customer email). */
   readonly cipher: EnvelopeCipher;
+  /** Key of the customer email lookup hash (derived from the PII KEK). */
+  readonly emailHashKey: Buffer;
+  /** Verifier nonces for refund payloads signed from an Intents account. */
+  readonly nonces: Nonces;
   readonly settings: PaymentsSettings;
   readonly caches: Caches;
   readonly random: () => number;

@@ -8,11 +8,9 @@
 import { enqueueJob } from "@nearpay-internal/db";
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
-import type { InternalSettlementDestination } from "@nearpay-internal/spec";
 import { originsProblem, sessionTtl } from "../domain/checkout-session/session.js";
 import { isAttemptStatus } from "../domain/payment-attempt/attempt.js";
 import { canExpire, onSessionDeadline } from "../domain/payment-intent/intent.js";
-import { type AssetInfo, type Pricing, pricingUsdMicros } from "../domain/pricing/pricing.js";
 import type { DestinationSnapshotJson } from "../infra/db/schema.js";
 import type { Payments, Tx } from "./context.js";
 import {
@@ -26,6 +24,7 @@ import {
   updateSession,
 } from "./ledger.js";
 import { type Page, type PageQuery, pageOf } from "./pages.js";
+import { validatePrice } from "./pricing.js";
 import { newClientSecret } from "./secrets.js";
 import { settlementContext } from "./settlement-context.js";
 import { type AttemptRow, type IntentRow, type SessionRow, sessionView } from "./views.js";
@@ -55,105 +54,53 @@ export interface SessionCreate {
   readonly metadata?: Record<string, string> | undefined;
 }
 
-/** Rails' asset decimals, symbol and price (5-minute cache). */
-export async function assetInfo(p: Payments, assetId: string, livemode: boolean) {
-  try {
-    return await p.caches.assets.get(`${livemode}|${assetId}`, () => p.rails.asset(assetId, livemode));
-  } catch (e) {
-    p.log.warn({ asset: assetId, err: e instanceof Error ? e.message : String(e) }, "rails asset lookup failed");
-    throw new ApiError("rail_unavailable", { params: { reason: "asset lookup failed" } });
-  }
+export { assetInfo } from "./pricing.js";
+
+/** What opens a session: the merchant API, an API intent (headless), or a payment link payer. */
+export interface SessionSpec extends SessionCreate {
+  readonly source: "checkout" | "payment_link" | "api";
+  readonly customerId?: string | null;
+  readonly paymentLinkId?: string | null;
+  readonly headless?: boolean;
 }
 
-const toInfo = (a: { decimals: number; price_usd: string | null; is_usd_stable: boolean }): AssetInfo => ({
-  decimals: a.decimals,
-  priceUsd: a.price_usd,
-  isUsdStable: a.is_usd_stable,
-});
-
-/** `chain|address_norm|asset_id` (rails §8.9). */
-export const destinationKey = (d: { chain: string; address_norm: string; asset_id: string }) =>
-  `${d.chain}|${d.address_norm}|${d.asset_id}`;
+export interface Opened {
+  readonly s: SessionRow;
+  readonly i: IntentRow;
+  readonly secret: string;
+  readonly url: string;
+}
 
 /**
- * Rails' minimum for a destination in USD micros (1-hour cache). An unreachable rails skips the check:
- * the minimum is an economic guard (FR-SET-04), never a safety one, and rails re-checks on quote.
+ * The customer to attach (same account and mode); a deleted one is refused (`customer_deleted`).
+ * Returns its uuid.
  */
-async function minimumUsdMicros(p: Payments, d: InternalSettlementDestination): Promise<bigint | null> {
-  const key = destinationKey(d);
-  try {
-    const m = await p.caches.minimums.get(key, async () => {
-      const all = await p.rails.minimums([key]);
-      const v = all[key];
-      return v ? { min_usd_micros: v.min_usd_micros, min_amount_base: v.min_amount_base } : null;
-    });
-    return m?.min_usd_micros === null || m?.min_usd_micros === undefined ? null : BigInt(m.min_usd_micros);
-  } catch (e) {
-    p.log.warn({ destination: d.id, err: e instanceof Error ? e.message : String(e) }, "minimum unavailable");
-    return null;
-  }
+export async function attachableCustomer(p: Payments, m: Merchant, id: string | undefined): Promise<string | null> {
+  if (!id) return null;
+  const c = await p.db
+    .selectFrom("customers")
+    .select(["id", "deleted_at"])
+    .where("id", "=", toUuid(id, "cus"))
+    .where("account_id", "=", m.account)
+    .where("livemode", "=", m.livemode)
+    .executeTakeFirst();
+  if (!c) throw ApiError.missing("customer", id, "customer");
+  if (c.deleted_at) throw new ApiError("customer_deleted", { param: "customer" });
+  return c.id;
 }
 
-const usd = (micros: bigint) => `USD ${(Number(micros) / 1_000_000).toFixed(2)}`;
-
-function pick(
-  ctx: { destinations: readonly InternalSettlementDestination[]; defaults: Record<string, string> },
-  requested: string | undefined,
-  pricingAsset: string | null,
-): InternalSettlementDestination {
-  const id = requested ?? (pricingAsset ? ctx.defaults[pricingAsset] : undefined) ?? ctx.defaults["*"];
-  const d = id ? ctx.destinations.find((x) => x.id === id) : undefined;
-  if (d?.status !== "active")
-    throw new ApiError("destination_not_active", {
-      ...(requested ? { param: "settlement_destination" } : {}),
-      message: requested
-        ? `Settlement destination ${requested} is not active in this mode.`
-        : "The account has no active default settlement destination in this mode.",
-    });
-  return d;
-}
-
-/** `POST /v1/checkout/sessions` (§8.1). */
-export async function createSession(p: Payments, m: Merchant, body: SessionCreate) {
+/**
+ * Opens a checkout session and its intent (§8.1): validates the price, snapshots destination, fee
+ * schedule + bearer and settings (INV-6) and schedules `session.expire`, in one transaction.
+ */
+export async function openSession(p: Payments, m: Merchant, body: SessionSpec): Promise<Opened> {
   const ctx = await settlementContext(p, m.account, m.livemode);
   if (m.livemode && !ctx.account.live_enabled) throw new ApiError("account_not_live");
   const assetPriced = body.currency === "asset";
-  if (!assetPriced && !p.settings.pricingCurrencies.has(body.currency))
-    throw new ApiError("currency_unsupported", { param: "currency", params: { currency: body.currency } });
-
-  const dest = pick(ctx, body.settlement_destination, assetPriced ? (body.asset_id as string) : null);
   const origins = body.allowed_origins ?? [];
   const problem = originsProblem(body.ui_mode, origins, m.livemode);
   if (problem) throw new ApiError("allowed_origins_required", { param: "allowed_origins", message: problem });
-
-  const destAsset = await assetInfo(p, dest.asset_id, m.livemode);
-  const pricing: Pricing = assetPriced
-    ? { kind: "asset", assetId: body.asset_id as string, amount: BigInt(body.amount) }
-    : { kind: "fiat", currency: body.currency, amount: BigInt(body.amount) };
-  const pricingAsset =
-    pricing.kind === "asset"
-      ? pricing.assetId === dest.asset_id
-        ? destAsset
-        : await assetInfo(p, pricing.assetId, m.livemode)
-      : null;
-  const value = pricingUsdMicros(pricing, pricingAsset ? toInfo(pricingAsset) : null);
-
-  const min = await minimumUsdMicros(p, dest);
-  if (min !== null && value !== null && value < min)
-    throw new ApiError("amount_below_destination_minimum", {
-      param: "amount",
-      message: `The amount (${usd(value)}) is below this destination's minimum of ${usd(min)}.`,
-    });
-  // an unverified destination caps each payment; a price that cannot be valued cannot be capped
-  const cap = dest.verification === "unverified" ? dest.per_payment_cap_usd_micros : null;
-  if (cap !== null && (value === null || value > BigInt(cap)))
-    throw new ApiError("amount_above_unverified_cap", {
-      param: "amount",
-      message:
-        value === null
-          ? "This destination is unverified and the amount cannot be valued in USD to check its cap."
-          : `This destination is unverified; payments are capped at ${usd(BigInt(cap))}.`,
-    });
+  const { dest, destAsset } = await validatePrice(p, m.livemode, ctx, body);
 
   const settings = ctx.account.settings;
   const ttl = sessionTtl(body.expires_in, settings.session_ttl_default);
@@ -172,6 +119,7 @@ export async function createSession(p: Payments, m: Merchant, body: SessionCreat
     attestation_hash: dest.attestation_hash,
     verification: dest.verification,
     per_payment_cap_usd_micros: dest.per_payment_cap_usd_micros,
+    fingerprint: dest.fingerprint ?? null,
   };
   const metadata = JSON.stringify(body.metadata ?? {});
   const expiresAt = new Date(now + ttl * 1000);
@@ -189,7 +137,9 @@ export async function createSession(p: Payments, m: Merchant, body: SessionCreat
         pricing_asset_id: assetPriced ? (body.asset_id as string) : null,
         pricing_asset_amount: assetPriced ? String(body.amount) : null,
         description: body.description ?? null,
-        source: "checkout",
+        source: body.source,
+        customer_id: body.customerId ?? null,
+        payment_link_id: body.paymentLinkId ?? null,
         destination_snapshot: JSON.stringify(snapshot),
         fee_snapshot: JSON.stringify({ schedule: ctx.fee_schedule, bearer: ctx.account.fee_bearer }),
         settings_snapshot: JSON.stringify({
@@ -224,10 +174,14 @@ export async function createSession(p: Payments, m: Merchant, body: SessionCreat
         locale: body.locale ?? null,
         allowed_origins: [...origins],
         metadata,
+        customer_id: body.customerId ?? null,
+        payment_link_id: body.paymentLinkId ?? null,
+        headless: body.headless ?? false,
         version: 1,
       })
       .returningAll()
       .executeTakeFirstOrThrow();
+    const actor = body.source === "payment_link" ? "payer" : "merchant";
     await tx
       .insertInto("payment_intent_transitions")
       .values({
@@ -235,8 +189,13 @@ export async function createSession(p: Payments, m: Merchant, body: SessionCreat
         payment_intent_id: intentId,
         from_state: null,
         to_state: "requires_payment",
-        cause: "checkout session created",
-        actor: "merchant",
+        cause:
+          body.source === "api"
+            ? "payment intent created"
+            : body.source === "payment_link"
+              ? "payment link session opened"
+              : "checkout session created",
+        actor,
         evidence: null,
       })
       .execute();
@@ -247,8 +206,8 @@ export async function createSession(p: Payments, m: Merchant, body: SessionCreat
         checkout_session_id: sessionId,
         from_state: null,
         to_state: "open",
-        cause: "created",
-        actor: "merchant",
+        cause: body.headless ? "created (headless, API intent)" : "created",
+        actor,
         evidence: null,
       })
       .execute();
@@ -262,7 +221,19 @@ export async function createSession(p: Payments, m: Merchant, body: SessionCreat
     });
     return { s: s0, i: i0 };
   });
-  return sessionView(s, i, { secret: secret.secret, url: `${p.settings.payOrigin}/c/${csId}#${secret.secret}` });
+  return { s, i, secret: secret.secret, url: `${p.settings.payOrigin}/c/${csId}#${secret.secret}` };
+}
+
+export interface CheckoutCreate extends SessionCreate {
+  readonly customer?: string | undefined;
+}
+
+/** `POST /v1/checkout/sessions` (§8.1). */
+export async function createSession(p: Payments, m: Merchant, body: CheckoutCreate) {
+  const { customer, ...rest } = body;
+  const customerId = await attachableCustomer(p, m, customer);
+  const o = await openSession(p, m, { ...rest, source: "checkout", customerId });
+  return sessionView(o.s, o.i, { secret: o.secret, url: o.url });
 }
 
 async function ownSession(p: Payments, m: Merchant, id: string): Promise<SessionRow> {

@@ -145,6 +145,8 @@ function executionBody(i: IntentRow, s: SessionRow, attemptId: string, r: Attemp
         : { currency: i.currency, amount: Number(i.amount) },
     fee: { schedule: i.fee_snapshot.schedule as CreateExecutionBody["fee"]["schedule"], bearer: i.fee_snapshot.bearer },
     deadline_cap: i.settings_snapshot.late_payments ? null : s.expires_at.toISOString(),
+    // Stage 2 (§17 item 14): rails echoes it as `Execution.reference`; compliance attributes reviews by it
+    reference: { payment_intent: fromUuid("pi", i.id), payment_attempt: fromUuid("pa", attemptId) },
   } as CreateExecutionBody;
 }
 

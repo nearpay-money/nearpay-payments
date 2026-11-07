@@ -6,11 +6,15 @@
 import type {
   BalanceTransaction,
   CheckoutSession,
+  Customer,
   IntentStreamEvent,
   PayerAttempt,
   PaymentIntent,
+  PaymentLink,
   PublicCheckoutSession,
+  Refund,
 } from "@nearpay/spec";
+import type { ReconciliationRun } from "@nearpay-internal/spec";
 import { getChain } from "@nearpay-internal/chains";
 import type { Selectable } from "@nearpay-internal/db";
 import { fromUuid } from "@nearpay-internal/ids";
@@ -19,14 +23,24 @@ import type { z } from "zod";
 import type {
   BalanceTransactionsTable,
   CheckoutSessionsTable,
+  CustomersTable,
   PaymentAttemptsTable,
   PaymentIntentsTable,
+  PaymentLinksTable,
+  ReconciliationRunsTable,
+  RefundLegsTable,
+  RefundsTable,
 } from "../infra/db/schema.js";
 
 export type IntentRow = Selectable<PaymentIntentsTable>;
 export type SessionRow = Selectable<CheckoutSessionsTable>;
 export type AttemptRow = Selectable<PaymentAttemptsTable>;
 export type LineRow = Selectable<BalanceTransactionsTable>;
+export type RefundRow = Selectable<RefundsTable>;
+export type LegRow = Selectable<RefundLegsTable>;
+export type LinkRow = Selectable<PaymentLinksTable>;
+export type CustomerRow = Selectable<CustomersTable>;
+export type RunRow = Selectable<ReconciliationRunsTable>;
 
 type Intent = z.input<typeof PaymentIntent>;
 type Session = z.input<typeof CheckoutSession>;
@@ -73,7 +87,18 @@ export function attemptSummary(a: AttemptRow) {
 export const newestFirst = (attempts: readonly AttemptRow[]) =>
   [...attempts].sort((x, y) => y.created_at.getTime() - x.created_at.getTime() || (x.id < y.id ? 1 : -1));
 
-export function intentView(i: IntentRow, attempts: readonly AttemptRow[], sessionUuid: string | null): Intent {
+/** Refunds of an intent (uuid + created), for `PaymentIntent.refunds` (newest first). */
+export interface RefundRef {
+  readonly id: string;
+  readonly created_at: Date;
+}
+
+export function intentView(
+  i: IntentRow,
+  attempts: readonly AttemptRow[],
+  sessionUuid: string | null,
+  refunds: readonly RefundRef[] = [],
+): Intent {
   const d = i.destination_snapshot;
   const sorted = newestFirst(attempts);
   const priced = sorted.find((a) => a.id === i.succeeded_attempt_id) ?? sorted.find((a) => a.applied_fee_bps !== null);
@@ -93,6 +118,7 @@ export function intentView(i: IntentRow, attempts: readonly AttemptRow[], sessio
       type: d.type,
       chain: d.chain,
       address: d.address,
+      fingerprint: d.fingerprint ?? null,
     },
     // the fee of the route that paid (or was last quoted); 0 until a route is quoted
     fee: { bearer: i.fee_snapshot.bearer, total_bps: priced?.applied_fee_bps ?? 0 },
@@ -114,6 +140,20 @@ export function intentView(i: IntentRow, attempts: readonly AttemptRow[], sessio
       })),
     sequence: i.sequence,
     metadata: i.metadata,
+    // stage 2
+    customer: i.customer_id ? fromUuid("cus", i.customer_id) : null,
+    payment_link: i.payment_link_id ? fromUuid("plink", i.payment_link_id) : null,
+    amount_refund_pending: i.amount_refund_pending,
+    refunds: [...refunds]
+      .sort((x, y) => y.created_at.getTime() - x.created_at.getTime() || (x.id < y.id ? 1 : -1))
+      .map((r) => fromUuid("re", r.id)),
+    review_decision: i.review_decision
+      ? {
+          decision: i.review_decision.decision,
+          decided_at: unix(new Date(i.review_decision.decided_at)),
+          refund: i.review_decision.refund ? (fromUuid("re", i.review_decision.refund) as `re_${string}`) : null,
+        }
+      : null,
   } as Intent;
 }
 
@@ -147,6 +187,8 @@ export function sessionView(
     // and it is the `aggregate.version` its events carry (0.1.5, CR-15-09)
     sequence: s.version,
     metadata: s.metadata,
+    customer: s.customer_id ? fromUuid("cus", s.customer_id) : null,
+    payment_link: s.payment_link_id ? fromUuid("plink", s.payment_link_id) : null,
   } as Session;
 }
 
@@ -230,5 +272,154 @@ export function lineView(l: LineRow): z.input<typeof BalanceTransaction> {
         ? { bps: l.fee_bps, amount_estimated: l.fee_amount_est, asset_id: l.fee_asset_id }
         : null,
     evidence: l.evidence as z.input<typeof BalanceTransaction>["evidence"],
+    refund_leg: l.refund_leg,
+    received: l.received,
+    fee_adjustment: (l.fee_adjustment as z.input<typeof BalanceTransaction>["fee_adjustment"]) ?? null,
   } as z.input<typeof BalanceTransaction>;
+}
+
+// ------------------------------------------------------------------------------------------- stage 2
+
+type RefundView = z.input<typeof Refund>;
+
+/** Legs as the API shows them: prepared legs only (a leg being prepared has no instructions yet), newest first. */
+export function legViews(legs: readonly LegRow[]): RefundView["legs"] {
+  return [...legs]
+    .filter((l) => l.status !== "preparing")
+    .sort((a, b) => b.number - a.number)
+    .map((l) => ({
+      number: l.number,
+      status: l.status as RefundView["legs"][number]["status"],
+      method: l.method,
+      swap_type: l.swap_type,
+      amount: l.amount,
+      amount_out_expected: l.amount_out_expected,
+      deadline: unix(l.deadline ?? l.created_at),
+      submitted_tx: l.submitted_tx,
+      duplicate: l.duplicate,
+      evidence: (l.evidence as RefundView["evidence"]) ?? null,
+      failure_code: l.failure_code,
+      created: unix(l.created_at),
+    }));
+}
+
+/**
+ * The refund object. `next_action` is shown only in `requires_action` while the current leg awaits its
+ * signature and its deadline has not passed.
+ */
+export function refundView(
+  r: RefundRow,
+  legs: readonly LegRow[],
+  asset: { readonly id: string; readonly decimals: number },
+  now: number,
+): RefundView {
+  const current = legs.find((l) => l.id === r.current_leg_id) ?? null;
+  const live =
+    r.status === "requires_action" &&
+    current?.status === "awaiting_signature" &&
+    current.next_action !== null &&
+    current.deadline !== null &&
+    current.deadline.getTime() > now;
+  return {
+    id: fromUuid("re", r.id),
+    object: "refund",
+    created: unix(r.created_at),
+    livemode: r.livemode,
+    status: r.status,
+    payment_intent: fromUuid("pi", r.payment_intent_id),
+    payment_attempt: fromUuid("pa", r.payment_attempt_id),
+    amount: r.amount,
+    asset_id: asset.id,
+    decimals: asset.decimals,
+    fee_mode: r.fee_mode,
+    reason: r.reason as RefundView["reason"],
+    method: r.method,
+    recipient: {
+      address: r.recipient,
+      asset_id: r.recipient_asset_id,
+      chain: r.recipient_chain,
+      type: r.recipient_type,
+      overridden: r.recipient_overridden,
+    },
+    next_action: live ? (current?.next_action as RefundView["next_action"]) : null,
+    legs: legViews(legs),
+    amount_received: r.amount_received,
+    evidence: (r.evidence as RefundView["evidence"]) ?? null,
+    extra_amount_sent: r.extra_amount_sent,
+    source: r.source,
+    failure_code: r.failure_code,
+    succeeded_at: unixOrNull(r.succeeded_at),
+    canceled_at: unixOrNull(r.canceled_at),
+    sequence: r.version,
+    metadata: r.metadata,
+  } as RefundView;
+}
+
+export function linkView(l: LinkRow, payOrigin: string): z.input<typeof PaymentLink> {
+  const id = fromUuid("plink", l.id);
+  return {
+    id,
+    object: "payment_link",
+    created: unix(l.created_at),
+    livemode: l.livemode,
+    active: l.active,
+    url: `${payOrigin}/l/${id}`,
+    amount: l.currency === "asset" ? (l.pricing_asset_amount as string) : Number(l.amount),
+    currency: l.currency,
+    asset_id: l.pricing_asset_id,
+    description: l.description,
+    settlement_destination: l.settlement_destination_id as `sd_${string}` | null,
+    success_url: l.success_url,
+    session_expires_in: l.session_expires_in,
+    max_uses: l.max_uses,
+    uses: l.uses,
+    collect_email: l.collect_email,
+    metadata: l.metadata,
+  } as z.input<typeof PaymentLink>;
+}
+
+export function customerView(
+  c: CustomerRow,
+  pii: { email: string | null; name: string | null },
+): z.input<typeof Customer> {
+  return {
+    id: fromUuid("cus", c.id),
+    object: "customer",
+    created: unix(c.created_at),
+    livemode: c.livemode,
+    email: pii.email,
+    name: pii.name,
+    description: c.description,
+    wallets: c.wallets,
+    metadata: c.metadata,
+  } as z.input<typeof Customer>;
+}
+
+/** A `date` column as `YYYY-MM-DD` (node-postgres parses `date` into a local-midnight Date). */
+export function dayString(v: unknown): string {
+  if (v instanceof Date) {
+    const p2 = (n: number) => String(n).padStart(2, "0");
+    return `${v.getFullYear()}-${p2(v.getMonth() + 1)}-${p2(v.getDate())}`;
+  }
+  return String(v).slice(0, 10);
+}
+
+export function runView(r: RunRow): z.input<typeof ReconciliationRun> {
+  return {
+    id: fromUuid("rcn", r.id),
+    object: "reconciliation_run",
+    account_id: fromUuid("acct", r.account_id),
+    livemode: r.livemode,
+    day: dayString(r.day),
+    status: r.status,
+    trigger: r.trigger,
+    rerun_of: r.rerun_of ? fromUuid("rcn", r.rerun_of) : null,
+    started_at: r.started_at.toISOString(),
+    completed_at: r.completed_at ? r.completed_at.toISOString() : null,
+    totals: r.totals,
+    diffs: r.diffs,
+    diff_count: r.diffs.length,
+    error: r.error,
+    resolution: r.resolution,
+  } as z.input<typeof ReconciliationRun>;
 }

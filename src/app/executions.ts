@@ -10,6 +10,7 @@ import type { PaymentAttemptsTable } from "../infra/db/schema.js";
 import { type Applied, applyAttemptChange } from "./apply.js";
 import type { Payments, Tx } from "./context.js";
 import { attemptsOf, lockIntent, lockSessionOfIntent, updateAttempt } from "./ledger.js";
+import { applyRefundExecution } from "./refunds.js";
 import type { AttemptRow } from "./views.js";
 
 /** Attempt columns an execution determines. */
@@ -72,7 +73,7 @@ export async function applyExecutionToAttempt(
   return applyAttemptChange(
     p,
     tx,
-    { intent, session, before, after, others: attempts.filter((a) => a.id !== attemptId) },
+    { intent, session, before, after, others: attempts.filter((a) => a.id !== attemptId), terminalAt: x.terminal_at },
     { cause: `execution ${x.id} ${x.state}`, actor },
   );
 }
@@ -82,7 +83,11 @@ export const UNKNOWN_GRACE_MS = 2 * 60_000;
 
 /** Consumer path: the attempt is found by execution id; unknown recent executions are retried. */
 export async function applyExecutionEvent(p: Payments, tx: Tx, x: Execution): Promise<Applied | null> {
-  if (x.kind !== "payment") return null; // refunds arrive in Stage 2
+  if (x.kind === "refund") {
+    await applyRefundExecution(p, tx, x);
+    return null;
+  }
+  if (x.kind !== "payment") return null;
   const row = await tx.selectFrom("payment_attempts").select("id").where("execution_id", "=", x.id).executeTakeFirst();
   if (!row) {
     if (p.now() - Date.parse(x.created_at) < UNKNOWN_GRACE_MS)

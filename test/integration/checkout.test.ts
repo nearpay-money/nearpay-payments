@@ -123,7 +123,11 @@ describe("paying (payer → rails → worker)", () => {
     });
     expect(JSON.stringify(pub.body)).not.toContain("acme.near");
     expect(
-      (await st.call("GET", `/v1/checkout/sessions/${cs}/public`, { secret: `${secret.slice(0, -1)}${secret.endsWith("x") ? "y" : "x"}` })).status,
+      (
+        await st.call("GET", `/v1/checkout/sessions/${cs}/public`, {
+          secret: `${secret.slice(0, -1)}${secret.endsWith("x") ? "y" : "x"}`,
+        })
+      ).status,
     ).toBe(401);
 
     const opts = await st.call("GET", `/v1/checkout/sessions/${cs}/public/payment_options`, { secret });

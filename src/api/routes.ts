@@ -235,7 +235,8 @@ export function paymentsRoutes(p: Payments): RouteBinding[] {
     implement(deleteCustomer, async (ctx) => customers.deleteCustomer(p, merchant(ctx), ctx.params.id) as never),
 
     // ---- stage 2: internal
-    implement(getInternalRefund, async (ctx) => refunds.getRefundById(p, ctx.params.id) as never),
+    // agentpay reads the issued payload here while payments holds the leg `submitting` (refundView `relaying`)
+    implement(getInternalRefund, async (ctx) => refunds.getRefundById(p, ctx.params.id, { relaying: true }) as never),
     implement(getRefundReceiptContext, async (ctx) => refunds.refundReceiptContext(p, ctx.params.id) as never),
     implement(
       getPayerCheckoutSession,

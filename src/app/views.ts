@@ -322,17 +322,23 @@ export function legViews(legs: readonly LegRow[]): RefundView["legs"] {
 /**
  * The refund object. `next_action` is shown only in `requires_action` while the current leg awaits its
  * signature and its deadline has not passed.
+ *
+ * `relaying` (the internal view agentpay reads while it validates a merchant-signed leg, payments §8.4): the
+ * leg is already `submitting` under payments' row lock when agentpay asks for the issued payload, so that view
+ * also shows the action of a `submitting` leg. Without it every Intents-account refund relay was refused
+ * (`intent_invalid`: "the refund has no leg awaiting a signed intent"; step 2.4 integration).
  */
 export function refundView(
   r: RefundRow,
   legs: readonly LegRow[],
   asset: { readonly id: string; readonly decimals: number },
   now: number,
+  o: { readonly relaying?: boolean } = {},
 ): RefundView {
   const current = legs.find((l) => l.id === r.current_leg_id) ?? null;
   const live =
     r.status === "requires_action" &&
-    current?.status === "awaiting_signature" &&
+    (current?.status === "awaiting_signature" || (o.relaying === true && current?.status === "submitting")) &&
     current.next_action !== null &&
     current.deadline !== null &&
     current.deadline.getTime() > now;

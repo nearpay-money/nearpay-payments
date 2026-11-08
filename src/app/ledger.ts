@@ -6,8 +6,9 @@
  */
 
 import type { Updateable } from "@nearpay-internal/db";
-import { emit } from "@nearpay-internal/db";
+import { emit, sql } from "@nearpay-internal/db";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
+import { type Contribution, totalsDelta } from "../domain/customer/totals.js";
 import type { IntentEvent, SessionEvent } from "../domain/payment-intent/intent.js";
 import type { CheckoutSessionsTable, PaymentAttemptsTable, PaymentIntentsTable } from "../infra/db/schema.js";
 import type { Tx } from "./context.js";
@@ -56,6 +57,7 @@ export async function updateIntent(
     .returningAll()
     .executeTakeFirst();
   if (!next) throw new Error(`payment intent ${cur.id} changed concurrently`);
+  await applyCustomerTotals(tx, cur, next);
   if (next.status !== cur.status)
     await tx
       .insertInto("payment_intent_transitions")
@@ -70,6 +72,48 @@ export async function updateIntent(
       })
       .execute();
   return next;
+}
+
+/** One signed change of a customer total row (upsert: concurrent intents of one customer serialise on the row). */
+async function bumpTotal(tx: Tx, i: IntentRow, c: Contribution, sign: 1 | -1): Promise<void> {
+  const amount = sign === 1 ? c.amount : -c.amount;
+  await tx
+    .insertInto("customer_totals")
+    .values({
+      customer_id: c.customer,
+      account_id: i.account_id,
+      livemode: i.livemode,
+      currency: c.currency,
+      asset_id: c.assetId,
+      amount: amount.toString(),
+      count: sign,
+    })
+    .onConflict((oc) =>
+      oc.columns(["customer_id", "currency", "asset_id"]).doUpdateSet({
+        amount: sql`customer_totals.amount + ${amount.toString()}::numeric`,
+        count: sql`customer_totals.count + ${sign}`,
+        updated_at: new Date(),
+      }),
+    )
+    .execute();
+}
+
+/**
+ * `Customer.total_paid` / `last_payment_at` (spec 0.2.1), in the transaction of every intent change: the
+ * intent's old contribution leaves, its new one enters (domain `totalsDelta`). Refunds never change it.
+ */
+export async function applyCustomerTotals(tx: Tx, before: IntentRow, after: IntentRow): Promise<void> {
+  const d = totalsDelta(before, after);
+  if (d.remove) await bumpTotal(tx, before, d.remove, -1);
+  if (d.add) {
+    await bumpTotal(tx, after, d.add, 1);
+    const at = after.succeeded_at ?? new Date();
+    await tx
+      .updateTable("customers")
+      .set({ last_payment_at: sql`greatest(coalesce(last_payment_at, ${at}::timestamptz), ${at}::timestamptz)` })
+      .where("id", "=", d.add.customer)
+      .execute();
+  }
 }
 
 export async function updateSession(

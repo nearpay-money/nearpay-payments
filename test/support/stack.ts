@@ -11,6 +11,7 @@ import { fromUuid, newId, toUuid } from "@nearpay-internal/ids";
 import { makeNonce } from "@nearpay-internal/intents";
 import type { Service } from "@nearpay-internal/service";
 import {
+  abandonExecution,
   createExecution,
   createInternalCase,
   createRefundExecution,
@@ -20,6 +21,7 @@ import {
   getEvidenceSummary,
   getGeoPolicy,
   getInternalAsset,
+  getKillSwitch,
   getSettlementContext,
   INTERNAL_ROUTES,
   listChainProfiles,
@@ -79,6 +81,13 @@ export interface Stack {
   readonly agentpay: MockPeer;
   readonly compliance: MockPeer;
   readonly sandbox: MockPeer;
+  readonly sentinel: MockPeer;
+  /** What sentinel `getKillSwitch` answers (null: sentinel unavailable → 500). */
+  killSwitchRead: { engaged: boolean; version?: number; reason: string } | null;
+  /** `abandonExecution` calls rails received (execution id, reason), in order. */
+  readonly abandoned: { id: string; reason: string }[];
+  /** Nonce rails 0.2.1 puts into refund transfers (null: rails 0.2.0, no nonce). */
+  refundNonce: string | null;
   readonly ticketPublic: KeyObject;
   readonly worker: { service: Service; payments: Payments } | null;
   readonly nats: (Started & { monitorUrl: string }) | null;
@@ -197,6 +206,8 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
   let failCreates = 0;
   let failRefunds = 0;
   let failRefundCode: string | undefined;
+  const knobs: { refundNonce: string | null } = { refundNonce: null };
+  const abandoned: { id: string; reason: string }[] = [];
   const evidenceDay = { day: new Date(Date.now() - 86_400_000).toISOString().slice(0, 10), complete: true };
   const rails = await mockPeer({ service: "rails", routes: INTERNAL_ROUTES });
   rails.on(getInternalAsset, async (ctx) => {
@@ -315,6 +326,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
             min_amount_in: "2010042",
             deadline: new Date(Date.now() + 1_800_000).toISOString(),
             chain: "eip155:8453",
+            fee_amount_in: "10042",
           },
       intents_requirement: intents
         ? {
@@ -403,6 +415,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
               amount: b.amount,
               memo: binding,
               deadline,
+              ...(knobs.refundNonce ? { nonce: knobs.refundNonce } : {}),
             }
           : null,
       },
@@ -499,6 +512,26 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string };
     return { data: settledOn(q.account_id, q.livemode, q.day), has_more: false } as never;
   });
+  rails.on(abandonExecution, async (ctx) => {
+    const cur = executions.get(ctx.params.id);
+    if (!cur) mockError("resource_missing");
+    const x = cur as Execution;
+    abandoned.push({ id: x.id, reason: ctx.body.reason });
+    if (x.kind !== "refund" || !["quoting", "awaiting_deposit", "expired_unpaid"].includes(x.state))
+      mockError("state_conflict");
+    if (x.state === "expired_unpaid") return x;
+    const next = {
+      ...x,
+      state: "expired_unpaid",
+      version: x.version + 1,
+      abandoned_at: new Date().toISOString(),
+      abandon_reason: ctx.body.reason,
+      updated_at: new Date().toISOString(),
+    } as Execution;
+    Object.defineProperty(next, "_key", { value: (x as { _key?: string })._key, enumerable: false });
+    executions.set(x.id, next);
+    return next;
+  });
   rails.on(submitExecutionDepositTx, async () => undefined as never);
   rails.on(signalExecution, async () => undefined as never);
 
@@ -533,6 +566,13 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     block_height: 1,
   }));
 
+  const killSwitch: { read: { engaged: boolean; version?: number; reason: string } | null } = { read: null };
+  const sentinel = await mockPeer({ service: "sentinel", routes: INTERNAL_ROUTES });
+  sentinel.on(getKillSwitch, async () => {
+    if (!killSwitch.read) throw new Error("sentinel is down");
+    return { ...killSwitch.read, actor: "ops", updated_at: new Date().toISOString() } as never;
+  });
+
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const config: WorkerConfig = {
     env: "test",
@@ -546,6 +586,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     railsUrl: rails.url,
     agentpayUrl: agentpay.url,
     complianceUrl: compliance.url,
+    sentinelUrl: sentinel.url,
     sandboxBaseUrl: sandbox.url,
     payOrigin: "https://pay.nearpay.localhost",
     ticketSigningKey: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
@@ -601,6 +642,20 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     agentpay,
     compliance,
     sandbox,
+    sentinel,
+    get killSwitchRead() {
+      return killSwitch.read;
+    },
+    set killSwitchRead(v) {
+      killSwitch.read = v;
+    },
+    abandoned,
+    get refundNonce() {
+      return knobs.refundNonce;
+    },
+    set refundNonce(v) {
+      knobs.refundNonce = v;
+    },
     ticketPublic: publicKey,
     worker,
     nats,
@@ -685,7 +740,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
       await worker?.service.stop().catch(() => {});
       await api.stop().catch(() => {});
       await bus?.close().catch(() => {});
-      for (const m of [identity, rails, agentpay, compliance, sandbox]) await m.stop().catch(() => {});
+      for (const m of [identity, rails, agentpay, compliance, sandbox, sentinel]) await m.stop().catch(() => {});
       await admin.close();
       await valkey?.stop().catch(() => {});
       await nats?.stop().catch(() => {});

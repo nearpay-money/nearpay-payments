@@ -50,7 +50,9 @@ import {
   type Rails,
   railsClient,
   type Sandbox,
+  type Sentinel,
   sandboxClient,
+  sentinelClient,
 } from "../infra/clients/peers.js";
 import { type Turnstile, turnstileClient, turnstileDisabled } from "../infra/clients/turnstile.js";
 import { MIGRATIONS_DIR } from "../infra/db/migrations.js";
@@ -59,7 +61,7 @@ import { type Notifier, notifier } from "../infra/notifier.js";
 import { memoryLimiter, type RateLimiter, rateLimiter } from "../infra/rate-limiter.js";
 import { jobHandlers, RECURRING } from "../workers/jobs.js";
 import { newCaches, noMetrics, type Payments, paymentsMetrics } from "./context.js";
-import { reportKillSwitchAtBoot } from "./kill-switch.js";
+import { syncKillSwitchAtBoot } from "./kill-switch.js";
 
 export interface ServiceDeps {
   database?: Database<DB>;
@@ -70,6 +72,7 @@ export interface ServiceDeps {
   agentpay?: Agentpay;
   compliance?: Compliance;
   sandbox?: Sandbox | null;
+  sentinel?: Sentinel | null;
   turnstile?: Turnstile;
   notifier?: Notifier;
   limiter?: RateLimiter;
@@ -110,6 +113,12 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
     rails: deps.rails ?? railsClient({ ...peer, baseUrl: config.railsUrl }),
     agentpay: deps.agentpay ?? agentpayClient({ ...peer, baseUrl: config.agentpayUrl }),
     compliance: deps.compliance ?? complianceClient({ ...peer, baseUrl: config.complianceUrl }),
+    sentinel:
+      deps.sentinel !== undefined
+        ? deps.sentinel
+        : config.sentinelUrl
+          ? sentinelClient({ ...peer, baseUrl: config.sentinelUrl })
+          : null,
     sandbox:
       deps.sandbox !== undefined
         ? deps.sandbox
@@ -202,6 +211,8 @@ export function createApi(config: ApiConfig, deps: ServiceDeps = {}): { service:
     readiness: readiness(b),
   });
   attach(b, service, deps);
+  // the api refuses live refunds while the state is unknown: read sentinel's at boot (spec 0.2.1)
+  void syncKillSwitchAtBoot(b.payments);
   return { service, payments: b.payments };
 }
 
@@ -219,11 +230,9 @@ export async function createWorker(
   const service = createService({ name: "payments", config, readiness: readiness(b) });
   attach(b, service, deps);
   const db = b.database;
-  // sentinel's state cannot be read at boot (no service route in spec 0.2.0): an unknown state keeps live
-  // refunds paused until the consumer applies `evt.sentinel.kill_switch.*` (finding 8)
-  await reportKillSwitchAtBoot(p).catch((e: unknown) =>
-    service.log.warn({ err: e instanceof Error ? e.message : String(e) }, "kill switch state not read at boot"),
-  );
+  // read sentinel's state at boot when the stored one is unknown (spec 0.2.1); while it stays unknown live
+  // refunds stay paused until the consumer applies `evt.sentinel.kill_switch.*` (finding 8)
+  await syncKillSwitchAtBoot(p);
 
   const bus = deps.bus ?? (await connectBus({ url: config.natsUrl, name: `payments-worker@${hostname()}` }));
   await ensureStreams(bus, [STREAMS.payments]);

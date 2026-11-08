@@ -24,6 +24,7 @@ import type {
   BalanceTransactionsTable,
   CheckoutSessionsTable,
   CustomersTable,
+  CustomerTotalsTable,
   PaymentAttemptsTable,
   PaymentIntentsTable,
   PaymentLinksTable,
@@ -41,6 +42,14 @@ export type LegRow = Selectable<RefundLegsTable>;
 export type LinkRow = Selectable<PaymentLinksTable>;
 export type CustomerRow = Selectable<CustomersTable>;
 export type RunRow = Selectable<ReconciliationRunsTable>;
+export type CustomerTotalRow = Selectable<CustomerTotalsTable>;
+
+/** `PricingAssetDisplay` (spec 0.2.1): the pricing asset of an asset-priced session or link. */
+export interface PricingAssetDisplay {
+  readonly asset_id: string;
+  readonly symbol: string;
+  readonly decimals: number;
+}
 
 type Intent = z.input<typeof PaymentIntent>;
 type Session = z.input<typeof CheckoutSession>;
@@ -76,6 +85,9 @@ export function attemptSummary(a: AttemptRow) {
     origin_chain: a.origin_chain,
     settlement_amount: a.settlement_amount,
     settled_amount: a.settled_amount,
+    // spec 0.2.1
+    origin_amount: a.deposited_amount,
+    refund_to: a.refund_to,
     deadline: unixOrNull(a.deadline),
     is_overpayment: a.is_overpayment,
     failure_code: a.failure_code,
@@ -202,11 +214,12 @@ export function payerAttempt(a: AttemptRow, ticket: string | null): z.input<type
     method: a.method,
     visible: a.visible,
     origin_asset_id: a.origin_asset_id,
-    deposit: d ? { ...d, origin_asset_id: a.origin_asset_id } : null,
+    deposit: d ? { ...d, fee_amount: d.fee_amount ?? null, origin_asset_id: a.origin_asset_id } : null,
     intents_requirement: a.intents_requirement as z.input<typeof PayerAttempt>["intents_requirement"],
     attestation_ticket: ticket,
     failure_code: a.failure_code,
     refunded_amount: a.refunded_amount,
+    amount_received: a.deposited_amount,
   };
 }
 
@@ -215,6 +228,7 @@ export function publicSession(
   i: IntentRow,
   merchantName: string,
   attempt: z.input<typeof PayerAttempt> | null,
+  pricingAsset?: PricingAssetDisplay | null,
 ): z.input<typeof PublicCheckoutSession> {
   const p = pricingOf(i);
   return {
@@ -239,6 +253,7 @@ export function publicSession(
     success_url: s.success_url,
     cancel_url: s.cancel_url,
     attempt,
+    ...(pricingAsset !== undefined ? { pricing_asset: pricingAsset } : {}),
   } as z.input<typeof PublicCheckoutSession>;
 }
 
@@ -369,6 +384,7 @@ export function linkView(l: LinkRow, payOrigin: string): z.input<typeof PaymentL
     currency: l.currency,
     asset_id: l.pricing_asset_id,
     description: l.description,
+    name: l.name,
     settlement_destination: l.settlement_destination_id as `sd_${string}` | null,
     success_url: l.success_url,
     session_expires_in: l.session_expires_in,
@@ -379,9 +395,23 @@ export function linkView(l: LinkRow, payOrigin: string): z.input<typeof PaymentL
   } as z.input<typeof PaymentLink>;
 }
 
+/** `Customer.total_paid` entries ordered by currency, then asset (stable output). */
+export function totalPaidView(rows: readonly CustomerTotalRow[]) {
+  return [...rows]
+    .filter((t) => t.count > 0)
+    .sort((a, b) => (a.currency + a.asset_id < b.currency + b.asset_id ? -1 : 1))
+    .map((t) => ({
+      currency: t.currency,
+      asset_id: t.currency === "asset" ? t.asset_id : null,
+      amount: t.currency === "asset" ? t.amount : Number(t.amount),
+      count: t.count,
+    }));
+}
+
 export function customerView(
   c: CustomerRow,
   pii: { email: string | null; name: string | null },
+  totals: readonly CustomerTotalRow[] = [],
 ): z.input<typeof Customer> {
   return {
     id: fromUuid("cus", c.id),
@@ -393,6 +423,8 @@ export function customerView(
     description: c.description,
     wallets: c.wallets,
     metadata: c.metadata,
+    total_paid: totalPaidView(totals),
+    last_payment_at: unixOrNull(c.last_payment_at),
   } as z.input<typeof Customer>;
 }
 
@@ -405,11 +437,12 @@ export function dayString(v: unknown): string {
   return String(v).slice(0, 10);
 }
 
-export function runView(r: RunRow): z.input<typeof ReconciliationRun> {
+export function runView(r: RunRow, accountDisplayName: string | null = null): z.input<typeof ReconciliationRun> {
   return {
     id: fromUuid("rcn", r.id),
     object: "reconciliation_run",
     account_id: fromUuid("acct", r.account_id),
+    account_display_name: accountDisplayName,
     livemode: r.livemode,
     day: dayString(r.day),
     status: r.status,

@@ -15,11 +15,14 @@
  * | rails FX rates / settlement estimate | 2 s | 1  | yes     |
  * | rails evidence (reconciliation) | 10 s | 1      | no      |
  * | compliance `POST /internal/cases` | 3 s | 0 (the case job retries, idempotent) | yes |
+ * | rails `POST /internal/executions/{id}/abandon` | 8 s | 0 (the abandon job retries, idempotent) | global |
+ * | sentinel `GET /internal/kill-switch` | 2 s | 1      | no      |
  */
 
 import type { RouteBody, RouteQuery, RouteResponse } from "@nearpay/spec";
 import { HttpError, httpClient, TimeoutError } from "@nearpay-internal/http";
 import {
+  abandonExecution,
   createExecution,
   createInternalCase,
   createRefundExecution,
@@ -30,6 +33,7 @@ import {
   getExecution,
   getGeoPolicy,
   getInternalAsset,
+  getKillSwitch,
   getSettlementContext,
   listChainProfiles,
   listEvidence,
@@ -68,6 +72,8 @@ export type SettlementEstimateResponse = RouteResponse<typeof estimateSettlement
 export type EvidenceSummaryResponse = RouteResponse<typeof getEvidenceSummary>;
 export type EvidencePage = RouteResponse<typeof listEvidence>;
 export type CreateCaseBody = RouteBody<typeof createInternalCase>;
+export type AbandonReason = RouteBody<typeof abandonExecution>["reason"];
+export type KillSwitchRead = RouteResponse<typeof getKillSwitch>;
 
 export interface Rails {
   createExecution(body: CreateExecutionBody): Promise<Execution>;
@@ -84,6 +90,9 @@ export interface Rails {
   estimate(q: RouteQuery<typeof estimateSettlement>): Promise<SettlementEstimateResponse>;
   evidenceSummary(accountId: string, livemode: boolean, day: string): Promise<EvidenceSummaryResponse>;
   evidence(q: RouteQuery<typeof listEvidence>): Promise<EvidencePage>;
+  // spec 0.2.1
+  /** Abandons a refund leg payments no longer uses (orphaned before any deposit); idempotent per execution. */
+  abandonExecution(id: string, body: { reason: AbandonReason; note?: string }): Promise<Execution>;
 }
 
 export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
@@ -130,7 +139,27 @@ export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
         query: { account_id: accountId, livemode: livemode ? "true" : "false", day } as never,
       }),
     evidence: (q) => reconcileRead.call(listEvidence, { query: q as never }),
+    abandonExecution: (id, body) =>
+      write.call(abandonExecution, { params: { id }, body, idempotencyKey: `abandon:${id}` }),
   };
+}
+
+export interface Sentinel {
+  /** Sentinel's current kill-switch state (`service:sentinel.read`, spec 0.2.1). */
+  killSwitch(): Promise<KillSwitchRead>;
+}
+
+export function sentinelClient(o: PeerOptions & { baseUrl: string }): Sentinel {
+  const c = httpClient({
+    target: "sentinel",
+    baseUrl: o.baseUrl,
+    timeoutMs: 2_000,
+    attempts: 2,
+    breaker: false,
+    serviceToken: o.serviceToken,
+    ...(o.fetch ? { fetch: o.fetch } : {}),
+  });
+  return { killSwitch: () => c.call(getKillSwitch) };
 }
 
 export interface Identity {

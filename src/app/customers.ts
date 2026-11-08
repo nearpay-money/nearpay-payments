@@ -11,7 +11,7 @@ import { dedupeWallets, normalizeEmail, type Wallet } from "../domain/customer/c
 import type { Payments } from "./context.js";
 import { type PageQuery, pageOf } from "./pages.js";
 import type { Merchant } from "./sessions.js";
-import { type CustomerRow, customerView } from "./views.js";
+import { type CustomerRow, type CustomerTotalRow, customerView } from "./views.js";
 
 export const emailHash = (p: Payments, email: string): Buffer =>
   createHmac("sha256", p.emailHashKey).update(normalizeEmail(email), "utf8").digest();
@@ -25,7 +25,32 @@ function decrypt(p: Payments, c: CustomerRow) {
   };
 }
 
-const view = (p: Payments, c: CustomerRow) => customerView(c, decrypt(p, c));
+/** Stored `total_paid` rows of the customers (maintained with every intent change, spec 0.2.1). */
+async function totalsOf(p: Payments, rows: readonly CustomerRow[]): Promise<Map<string, CustomerTotalRow[]>> {
+  const out = new Map<string, CustomerTotalRow[]>();
+  if (!rows.length) return out;
+  const first = rows[0] as CustomerRow;
+  const totals = await p.db
+    .selectFrom("customer_totals")
+    .selectAll()
+    .where("account_id", "=", first.account_id)
+    .where("livemode", "=", first.livemode)
+    .where(
+      "customer_id",
+      "in",
+      rows.map((c) => c.id),
+    )
+    .execute();
+  for (const t of totals) out.set(t.customer_id, [...(out.get(t.customer_id) ?? []), t]);
+  return out;
+}
+
+async function views(p: Payments, rows: readonly CustomerRow[]) {
+  const totals = await totalsOf(p, rows);
+  return rows.map((c) => customerView(c, decrypt(p, c), totals.get(c.id) ?? []));
+}
+
+const view = async (p: Payments, c: CustomerRow) => (await views(p, [c]))[0] as ReturnType<typeof customerView>;
 
 export interface CustomerFields {
   readonly email?: string | null | undefined;
@@ -89,7 +114,7 @@ export async function listCustomers(p: Payments, m: Merchant, q: PageQuery & { e
   const page = await pageOf(base, q, "cus");
   return {
     object: "list" as const,
-    data: page.rows.map((c) => view(p, c)),
+    data: await views(p, page.rows),
     has_more: page.hasMore,
     url: "/v1/customers",
   };

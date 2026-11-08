@@ -9,7 +9,7 @@
  */
 
 import { newId } from "@nearpay-internal/ids";
-import { type Execution, listEvidence } from "@nearpay-internal/spec";
+import { type Execution, getEvidenceSummary, listEvidence } from "@nearpay-internal/spec";
 import { domainEvent, execution, expectEvent } from "@nearpay-internal/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { expireAtDeadline } from "../../src/app/sessions.js";
@@ -166,6 +166,9 @@ describe("internal invoice sessions (billing, §20)", () => {
     );
     expect((await createInvoiceSession(invoiceBody(capped, cappedCus, inv(), { amount: 1000 }))).status).toBe(201);
     expect((await code(invoiceBody(m, cus, inv(), { currency: "sek" }))).code).toBe("currency_unsupported");
+    // spec 0.3.1 declares fx_rate_unavailable (503) on createInvoiceCheckoutSession (stale GBP rate in the fake rails)
+    const stale = await createInvoiceSession(invoiceBody(m, cus, inv(), { currency: "gbp" }));
+    expect([stale.status, stale.body.error.code]).toEqual([503, "fx_rate_unavailable"]);
     // live mode needs a live-enabled account (the customer must exist in live mode as well)
     const notLive = st.merchant({ liveEnabled: false });
     const liveCus = await st.call("POST", "/v1/customers", {
@@ -632,7 +635,12 @@ describe("rails executions owned by another service (§16.1)", () => {
     }, 30_000);
     expect(done).toMatchObject({ status: "ok", diff_count: 0, error: null });
     expect(done.totals[0]).toMatchObject({ inflow: { statement: "2000042", evidence: "2000042", executions: 1 } });
-    const listings = st.rails.calls.slice(before).filter((c) => c.routeId === listEvidence.id);
-    expect(listings.map((c) => (c.query as { owner?: string }).owner)).toEqual(["payments", undefined]);
+    // spec 0.3.1: summary and listing both ask for payments' executions; no unfiltered relisting
+    const calls = st.rails.calls.slice(before);
+    const owners = (id: string) =>
+      calls.filter((c) => c.routeId === id).map((c) => (c.query as { owner?: string }).owner);
+    expect(owners(listEvidence.id)).toEqual(["payments"]);
+    expect(owners(getEvidenceSummary.id)).toEqual(["payments"]);
+    // (the fake rails counts the agentpay row in an unfiltered summary: without `owner` the run would be `error`)
   });
 });

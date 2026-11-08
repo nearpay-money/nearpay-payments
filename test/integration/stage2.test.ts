@@ -342,7 +342,9 @@ describe("payment intents (API) and filters", () => {
         body: { amount: 500, currency, success_url: "https://s.example/t" },
       });
     expect((await mk("eur")).status).toBe(201);
-    expect((await mk("gbp")).body.error.code).toBe("fx_rate_unavailable");
+    // spec 0.3.1 declares fx_rate_unavailable (503) on createCheckoutSession
+    const stale = await mk("gbp");
+    expect([stale.status, stale.body.error.code]).toEqual([503, "fx_rate_unavailable"]);
     expect((await mk("chf")).body.error.code).toBe("currency_unsupported");
     expect((await mk("sek")).body.error.code).toBe("currency_unsupported");
   });

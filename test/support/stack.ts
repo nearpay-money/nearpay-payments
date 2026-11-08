@@ -479,8 +479,11 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
         (x.terminal_at ?? "").slice(0, 10) === day,
     );
   rails.on(getEvidenceSummary, async (ctx) => {
-    const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string };
-    const xs = settledOn(q.account_id, q.livemode, q.day);
+    const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string; owner?: string };
+    // spec 0.3.1: `owner` filters the totals (an execution without one is payments'); without it every owner counts
+    const xs = settledOn(q.account_id, q.livemode, q.day).filter(
+      (x) => !q.owner || (x.owner ?? "payments") === q.owner,
+    );
     const totals = new Map<string, { kind: string; state: string; asset_id: string; count: number; settled: bigint }>();
     for (const x of xs) {
       const asset = x.kind === "refund" ? x.settlement.asset_id : x.settlement.asset_id;
@@ -512,7 +515,7 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
   });
   rails.on(listEvidence, async (ctx) => {
     const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string; owner?: string };
-    // spec 0.3.0: `owner` filters (an execution without one is payments'); the summary counts every owner
+    // spec 0.3.0: `owner` filters (an execution without one is payments')
     const xs = settledOn(q.account_id, q.livemode, q.day).filter(
       (x) => !q.owner || (x.owner ?? "payments") === q.owner,
     );

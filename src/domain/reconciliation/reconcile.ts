@@ -306,24 +306,14 @@ export function dayBounds(day: string): { start: Date; end: Date } {
 }
 
 /**
- * Do rails' evidence pages agree with its day summary? (spec 0.3.0: payments lists only its own executions,
- * `listEvidence?owner=payments`, §16.1, but `getEvidenceSummary` has no owner filter and counts every owner's.)
- * `owned` = executions listed with `owner=payments`; `all` = the unfiltered listing, needed only when the
- * counts differ (another service — agentpay x402 — settled executions on the account that day). The pages
- * agree when the unfiltered listing matches the summary and its payments-owned part is exactly `owned`.
+ * Do rails' evidence pages agree with its day summary? Both are read with `owner=payments` (spec 0.3.1:
+ * `listEvidence?owner=` and `getEvidenceSummary?owner=`, §16.1), so other owners' executions (agentpay x402) are in
+ * neither. `listed` = rows of the owner-filtered listing; `owned` = those of them owned by payments (defence in
+ * depth). A row of another owner in a `owner=payments` listing means rails' filter is broken: the run fails closed.
  * Returns the problem, or null.
  */
-export function evidenceCountProblem(
-  owned: number,
-  summaryCount: number,
-  all?: { readonly total: number; readonly owned: number },
-): string | null {
-  if (owned === summaryCount) return null;
-  if (!all || owned > summaryCount)
-    return `rails evidence pages (${owned}) disagree with its summary (${summaryCount})`;
-  if (all.total !== summaryCount)
-    return `rails evidence pages of all owners (${all.total}) disagree with its summary (${summaryCount})`;
-  if (all.owned !== owned)
-    return `rails evidence pages owned by payments (${owned}) disagree with the unfiltered pages (${all.owned})`;
+export function evidenceCountProblem(listed: number, owned: number, summaryCount: number): string | null {
+  if (listed !== owned) return `rails listed ${listed - owned} execution(s) of other owners for owner=payments`;
+  if (owned !== summaryCount) return `rails evidence pages (${owned}) disagree with its summary (${summaryCount})`;
   return null;
 }

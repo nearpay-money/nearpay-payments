@@ -17,11 +17,20 @@ import {
   PublicCheckoutSession,
   Refund,
   streamCheckoutSession,
+  TestHelperPayment,
 } from "@nearpay/spec";
 import { unhandledSubjects } from "@nearpay-internal/bus";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { unimplementedRoutes } from "@nearpay-internal/service";
-import { INTERNAL_ROUTES, ReconciliationRun, SUBJECTS, type Subject } from "@nearpay-internal/spec";
+import {
+  createInvoiceCheckoutSession,
+  getInternalCheckoutSession,
+  INTERNAL_ROUTES,
+  InternalCustomer,
+  ReconciliationRun,
+  SUBJECTS,
+  type Subject,
+} from "@nearpay-internal/spec";
 import { USDC_NEAR } from "@nearpay-internal/testing";
 import { describe, expect, it } from "vitest";
 import { paymentsRoutes } from "../../src/api/routes.js";
@@ -50,12 +59,12 @@ import {
 const ALL = [...PUBLIC_ROUTES, ...INTERNAL_ROUTES];
 
 describe("routes and events", () => {
-  it("binds every Stage-1 and Stage-2 payments route (incl. /ops console routes), and nothing else", () => {
+  it("binds every Stage-1, Stage-2 and Stage-3 payments route (incl. /ops console routes), and nothing else", () => {
     const bindings = paymentsRoutes({} as never);
     expect(unimplementedRoutes("payments", ALL, bindings).map((r) => r.id)).toEqual([]);
     expect(bindings.map((b) => b.route.id).sort()).toEqual(
       [...new Map(ALL.map((r) => [r.id, r])).values()]
-        .filter((r) => r.service === "payments" && r.stage <= 2)
+        .filter((r) => r.service === "payments" && r.stage <= 3)
         .map((r) => r.id)
         .sort(),
     );
@@ -69,7 +78,7 @@ describe("routes and events", () => {
 
   it("emits every subject payments produces", () => {
     const produced = (Object.keys(SUBJECTS) as Subject[]).filter(
-      (k) => SUBJECTS[k].producer === "payments" && SUBJECTS[k].stage <= 2,
+      (k) => SUBJECTS[k].producer === "payments" && SUBJECTS[k].stage <= 3,
     );
     expect(produced.length).toBe(17);
     const files = (dir: string): string[] =>
@@ -412,6 +421,75 @@ describe("stage 2 objects", () => {
       diff_count: 1,
       account_display_name: "Acme Coffee",
       totals: [{ decimals: 6 }],
+    });
+  });
+});
+
+// ---- stage 3 objects (spec 0.3.0)
+describe("stage 3 objects", () => {
+  const invoice = uuidv7();
+  const i = intentRow({ source: "invoice", invoice_id: invoice, customer_id: uuidv7() });
+  const s = sessionRow(i, { status: "open", completed_at: null, invoice_id: invoice, customer_id: i.customer_id });
+
+  it("invoice intents and sessions carry `invoice` in the API and on every event billing consumes", () => {
+    const v = intentView(i, [], s.id);
+    expect(PaymentIntent.parse(v).invoice).toBe(fromUuid("in", invoice));
+    for (const sub of [
+      "evt.payments.payment_intent.succeeded",
+      "evt.payments.payment_intent.payment_failed",
+      "evt.payments.payment_intent.expired",
+    ] as const)
+      expect(SUBJECTS[sub].object.parse(v)).toHaveProperty("invoice", fromUuid("in", invoice));
+    const bus = sessionView(s, i);
+    expect(SUBJECTS["evt.payments.checkout_session.expired"].object.parse(bus)).toHaveProperty(
+      "invoice",
+      fromUuid("in", invoice),
+    );
+    // the internal create returns the secret and URL once; the internal read never does
+    const created = sessionView(s, i, {
+      secret: `${fromUuid("cs", s.id)}_secret_${"a".repeat(32)}`,
+      url: "https://pay.nearpay.localhost/c/x#y",
+    });
+    expect(createInvoiceCheckoutSession.response.parse(created)).toMatchObject({ invoice: fromUuid("in", invoice) });
+    expect(getInternalCheckoutSession.response.parse(bus)).toMatchObject({ client_secret: null, url: null });
+    // other sources: null (servers from 0.3.0 always send it)
+    expect(PaymentIntent.parse(intentView(intentRow(), [], null)).invoice).toBeNull();
+    expect(CheckoutSession.parse(sessionView(sessionRow(intentRow()), intentRow())).invoice).toBeNull();
+  });
+
+  it("the test-helper payment and the internal customer parse", () => {
+    expect(
+      TestHelperPayment.safeParse({
+        object: "test_helper_payment",
+        checkout_session: fromUuid("cs", s.id),
+        payment_intent: fromUuid("pi", i.id),
+        payment_attempt: fromUuid("pa", uuidv7()),
+        outcome: "succeeded",
+      }).success,
+    ).toBe(true);
+    const now = new Date();
+    const c = customerView(
+      {
+        id: uuidv7(),
+        account_id: i.account_id,
+        livemode: false,
+        email_hash: null,
+        email_enc: null,
+        name_enc: null,
+        description: null,
+        wallets: [],
+        metadata: {},
+        deleted_at: now,
+        last_payment_at: null,
+        created_at: now,
+        updated_at: now,
+        version: 2,
+      },
+      { email: null, name: null },
+    );
+    expect(InternalCustomer.parse({ ...c, account_id: fromUuid("acct", i.account_id), deleted: true })).toMatchObject({
+      deleted: true,
+      email: null,
     });
   });
 });

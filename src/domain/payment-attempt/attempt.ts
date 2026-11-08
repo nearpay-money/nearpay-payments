@@ -53,3 +53,12 @@ export function statusOfExecution(state: string): AttemptStatus {
 export function isNewer(eventVersion: number, appliedVersion: number): boolean {
   return eventVersion > appliedVersion;
 }
+
+/**
+ * Executions not owned by payments (spec 0.3.0 `Execution.owner`, §16.1): agentpay's cross-chain x402
+ * executions arrive on the same `evt.rails.execution.*` subjects and are acknowledged without effect.
+ * No owner (rails < 0.3.0) means payments, the only creator of executions before Stage 3.
+ */
+export function ownedByPayments(owner: string | null | undefined): boolean {
+  return owner === undefined || owner === null || owner === "payments";
+}

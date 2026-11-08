@@ -5,7 +5,7 @@
  */
 import type { Updateable } from "@nearpay-internal/db";
 import type { Execution } from "@nearpay-internal/spec";
-import { isNewer, statusOfExecution } from "../domain/payment-attempt/attempt.js";
+import { isNewer, ownedByPayments, statusOfExecution } from "../domain/payment-attempt/attempt.js";
 import type { PaymentAttemptsTable } from "../infra/db/schema.js";
 import { type Applied, applyAttemptChange } from "./apply.js";
 import type { Payments, Tx } from "./context.js";
@@ -87,6 +87,8 @@ export const UNKNOWN_GRACE_MS = 2 * 60_000;
 
 /** Consumer path: the attempt is found by execution id; unknown recent executions are retried. */
 export async function applyExecutionEvent(p: Payments, tx: Tx, x: Execution): Promise<Applied | null> {
+  // another service's execution (spec 0.3.0, §16.1): never applied here (the consumer acks it earlier)
+  if (!ownedByPayments(x.owner)) return null;
   if (x.kind === "refund") {
     await applyRefundExecution(p, tx, x);
     return null;

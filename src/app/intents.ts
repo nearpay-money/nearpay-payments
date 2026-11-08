@@ -91,6 +91,7 @@ export interface IntentListQuery extends PageQuery {
   readonly customer?: string | undefined;
   readonly payment_link?: string | undefined;
   readonly checkout_session?: string | undefined;
+  readonly invoice?: string | undefined;
   readonly [key: string]: unknown;
 }
 
@@ -98,7 +99,7 @@ export interface IntentListQuery extends PageQuery {
  * `GET /v1/payment_intents` with the ADR-0018 filters (AND-combined; each served by an index under
  * `(account_id, livemode)`, migration 0002): `status`, `created[…]`, `amount[gte|gt|lte|lt]`, `currency`,
  * `asset_id`, `settlement_asset_id`, `source`, `customer`, `payment_link`, `checkout_session`,
- * `metadata[key]` (exact, ≤ 10, `metadata @> {…}` on the GIN index).
+ * `metadata[key]` (exact, ≤ 10, `metadata @> {…}` on the GIN index); Stage 3 `invoice`.
  */
 export async function listIntents(p: Payments, m: Merchant, q: IntentListQuery) {
   let base = p.db
@@ -113,6 +114,8 @@ export async function listIntents(p: Payments, m: Merchant, q: IntentListQuery) 
   if (q.source) base = base.where("source", "=", q.source as IntentRow["source"]);
   if (q.customer) base = base.where("customer_id", "=", toUuid(q.customer, "cus"));
   if (q.payment_link) base = base.where("payment_link_id", "=", toUuid(q.payment_link, "plink"));
+  // stage 3 (§20 item 2): intents opened for an invoice (index pi_invoice, migration 0005)
+  if (q.invoice) base = base.where("invoice_id", "=", toUuid(q.invoice, "in"));
   if (q.checkout_session)
     base = base.where("id", "=", (eb) =>
       eb

@@ -168,3 +168,17 @@ export async function deleteCustomer(p: Payments, m: Merchant, id: string) {
       .execute();
   return { id: fromUuid("cus", c.id), object: "customer" as const, livemode: c.livemode, deleted: true as const };
 }
+
+/**
+ * `GET /internal/customers/{id}` (billing, `payments.read`; Stage 3 §20 item 4): any customer by id with its
+ * account and decrypted email (PII; never in events). A deleted customer is returned with `deleted: true` and
+ * its personal data erased (`email`/`name` null) so billing can refuse it with `customer_deleted`.
+ */
+export async function getInternalCustomer(p: Payments, id: string) {
+  const c = await p.db.selectFrom("customers").selectAll().where("id", "=", toUuid(id, "cus")).executeTakeFirst();
+  if (!c) throw ApiError.missing("customer", id);
+  const deleted = c.deleted_at !== null;
+  const totals = await totalsOf(p, [c]);
+  const v = customerView(c, deleted ? { email: null, name: null } : decrypt(p, c), totals.get(c.id) ?? []);
+  return { ...v, account_id: fromUuid("acct", c.account_id), deleted };
+}

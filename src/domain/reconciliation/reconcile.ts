@@ -304,3 +304,26 @@ export function dayBounds(day: string): { start: Date; end: Date } {
   const start = new Date(`${day}T00:00:00.000Z`);
   return { start, end: new Date(start.getTime() + 86_400_000) };
 }
+
+/**
+ * Do rails' evidence pages agree with its day summary? (spec 0.3.0: payments lists only its own executions,
+ * `listEvidence?owner=payments`, §16.1, but `getEvidenceSummary` has no owner filter and counts every owner's.)
+ * `owned` = executions listed with `owner=payments`; `all` = the unfiltered listing, needed only when the
+ * counts differ (another service — agentpay x402 — settled executions on the account that day). The pages
+ * agree when the unfiltered listing matches the summary and its payments-owned part is exactly `owned`.
+ * Returns the problem, or null.
+ */
+export function evidenceCountProblem(
+  owned: number,
+  summaryCount: number,
+  all?: { readonly total: number; readonly owned: number },
+): string | null {
+  if (owned === summaryCount) return null;
+  if (!all || owned > summaryCount)
+    return `rails evidence pages (${owned}) disagree with its summary (${summaryCount})`;
+  if (all.total !== summaryCount)
+    return `rails evidence pages of all owners (${all.total}) disagree with its summary (${summaryCount})`;
+  if (all.owned !== owned)
+    return `rails evidence pages owned by payments (${owned}) disagree with the unfiltered pages (${all.owned})`;
+  return null;
+}

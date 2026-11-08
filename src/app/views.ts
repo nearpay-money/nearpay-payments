@@ -166,6 +166,8 @@ export function intentView(
           refund: i.review_decision.refund ? (fromUuid("re", i.review_decision.refund) as `re_${string}`) : null,
         }
       : null,
+    // stage 3 (§20): the invoice an invoice intent pays; billing matches payment events by it
+    invoice: i.invoice_id ? fromUuid("in", i.invoice_id) : null,
   } as Intent;
 }
 
@@ -201,6 +203,8 @@ export function sessionView(
     metadata: s.metadata,
     customer: s.customer_id ? fromUuid("cus", s.customer_id) : null,
     payment_link: s.payment_link_id ? fromUuid("plink", s.payment_link_id) : null,
+    // stage 3 (§20): the invoice the session pays (billing matches `checkout_session.expired` by it)
+    invoice: s.invoice_id ? fromUuid("in", s.invoice_id) : null,
   } as Session;
 }
 

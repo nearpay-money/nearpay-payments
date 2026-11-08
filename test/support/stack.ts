@@ -101,6 +101,8 @@ export interface Stack {
     type?: "chain_address" | "intents_account";
   }): Merchant;
   token(m: Merchant, o?: { livemode?: boolean }): Promise<string>;
+  /** A restricted key (`rk_…`) token holding `scopes`. */
+  restrictedToken(m: Merchant, scopes: readonly string[], o?: { livemode?: boolean }): Promise<string>;
   /** A dashboard session token (role, optional fresh step-up). */
   sessionToken(m: Merchant, o?: { livemode?: boolean; role?: string; stepUp?: boolean }): Promise<string>;
   /** A service token of `service` (its catalogue scopes). */
@@ -509,8 +511,12 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     } as never;
   });
   rails.on(listEvidence, async (ctx) => {
-    const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string };
-    return { data: settledOn(q.account_id, q.livemode, q.day), has_more: false } as never;
+    const q = ctx.query as unknown as { account_id: string; livemode: boolean; day: string; owner?: string };
+    // spec 0.3.0: `owner` filters (an execution without one is payments'); the summary counts every owner
+    const xs = settledOn(q.account_id, q.livemode, q.day).filter(
+      (x) => !q.owner || (x.owner ?? "payments") === q.owner,
+    );
+    return { data: xs, has_more: false } as never;
   });
   rails.on(abandonExecution, async (ctx) => {
     const cur = executions.get(ctx.params.id);
@@ -679,6 +685,14 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     },
     token: (m, t = {}) =>
       mintTestToken({ sub: newId("key"), acct: m.account, lm: t.livemode ?? false, ptype: "secret_key", scp: [] }),
+    restrictedToken: (m, scopes, t = {}) =>
+      mintTestToken({
+        sub: newId("key"),
+        acct: m.account,
+        lm: t.livemode ?? false,
+        ptype: "restricted_key",
+        scp: [...scopes],
+      }),
     sessionToken: (m, t = {}) =>
       mintTestToken({
         sub: newId("usr"),

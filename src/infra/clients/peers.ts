@@ -88,6 +88,7 @@ export interface Rails {
   createRefundExecution(body: CreateRefundExecutionBody): Promise<Execution>;
   fxRates(livemode: boolean, currencies: readonly string[]): Promise<FxRatesResponse>;
   estimate(q: RouteQuery<typeof estimateSettlement>): Promise<SettlementEstimateResponse>;
+  /** Rails' day summary of payments' own executions (`owner=payments`, spec 0.3.1). */
   evidenceSummary(accountId: string, livemode: boolean, day: string): Promise<EvidenceSummaryResponse>;
   evidence(q: RouteQuery<typeof listEvidence>): Promise<EvidencePage>;
   // spec 0.2.1
@@ -136,7 +137,7 @@ export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
     estimate: (q) => read.call(estimateSettlement, { query: q as never }),
     evidenceSummary: (accountId, livemode, day) =>
       reconcileRead.call(getEvidenceSummary, {
-        query: { account_id: accountId, livemode: livemode ? "true" : "false", day } as never,
+        query: { account_id: accountId, livemode: livemode ? "true" : "false", day, owner: "payments" } as never,
       }),
     evidence: (q) => reconcileRead.call(listEvidence, { query: q as never }),
     abandonExecution: (id, body) =>

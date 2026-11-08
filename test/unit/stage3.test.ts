@@ -75,16 +75,15 @@ describe("test helper (§16.1)", () => {
   });
 });
 
-describe("reconciliation evidence count (spec 0.3.0 owner filter)", () => {
-  it("equal counts need no second listing", () => {
-    expect(evidenceCountProblem(3, 3)).toBeNull();
+describe("reconciliation evidence count (spec 0.3.1 owner-filtered summary)", () => {
+  it("accepts equal owned counts; agentpay executions are in neither the summary nor the listing", () => {
+    expect(evidenceCountProblem(3, 3, 3)).toBeNull();
+    expect(evidenceCountProblem(0, 0, 0)).toBeNull();
   });
-  it("another owner's executions explain a smaller owned count only when the unfiltered pages agree", () => {
-    expect(evidenceCountProblem(3, 5, { total: 5, owned: 3 })).toBeNull();
-    expect(evidenceCountProblem(3, 5)).toMatch(/disagree/);
-    expect(evidenceCountProblem(3, 5, { total: 4, owned: 3 })).toMatch(/all owners/);
-    expect(evidenceCountProblem(3, 5, { total: 5, owned: 4 })).toMatch(/owned by payments/);
-    expect(evidenceCountProblem(6, 5, { total: 6, owned: 6 })).toMatch(/disagree/);
+  it("reports a gap or an extra row, and fails closed on rows of other owners", () => {
+    expect(evidenceCountProblem(3, 3, 5)).toMatch(/disagree/);
+    expect(evidenceCountProblem(6, 6, 5)).toMatch(/disagree/);
+    expect(evidenceCountProblem(4, 3, 3)).toMatch(/1 execution\(s\) of other owners/);
   });
 });
 

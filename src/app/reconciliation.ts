@@ -126,13 +126,8 @@ export async function runJob(p: Payments, payload: unknown, attempt: number): Pr
  * Every settled execution of the day; `owner: "payments"` lists only payments' own (spec 0.3.0, §16.1: agentpay's
  * cross-chain x402 executions are not on payments' statement). Without an owner: every owner's (count check).
  */
-async function allEvidence(
-  p: Payments,
-  account: string,
-  livemode: boolean,
-  day: string,
-  owner?: "payments",
-): Promise<Execution[]> {
+/** Rails' evidence pages of payments' own executions of a day (`owner=payments`). */
+async function ownedEvidence(p: Payments, account: string, livemode: boolean, day: string): Promise<Execution[]> {
   const out: Execution[] = [];
   let after: string | undefined;
   for (;;) {
@@ -142,7 +137,7 @@ async function allEvidence(
       day,
       limit: 1000,
       states: "succeeded",
-      ...(owner ? { owner } : {}),
+      owner: "payments",
       ...(after ? { starting_after: after } : {}),
     } as never);
     out.push(...page.data);
@@ -290,19 +285,13 @@ export async function executeRun(
         error: `rails evidence for ${day} is not complete (${summary.in_flight} in flight, ${summary.held_open} held)`,
       });
     const [listed, lines] = await Promise.all([
-      allEvidence(p, run.account_id, run.livemode, day, "payments"),
+      ownedEvidence(p, run.account_id, run.livemode, day),
       statementOf(p, run.account_id, run.livemode, day),
     ]);
     // defence in depth: an execution rails labels with another owner is never reconciled as ours
     const evidence = listed.filter((x) => ownedByPayments(x.owner));
-    const expected = summaryCount(summary);
-    let all: { total: number; owned: number } | undefined;
-    if (evidence.length !== expected || listed.length !== evidence.length) {
-      // the summary counts every owner's executions: count them to tell another owner's from a gap
-      const unfiltered = await allEvidence(p, run.account_id, run.livemode, day);
-      all = { total: unfiltered.length, owned: unfiltered.filter((x) => ownedByPayments(x.owner)).length };
-    }
-    const countProblem = evidenceCountProblem(evidence.length, expected, all);
+    // summary and listing are both `owner=payments` (spec 0.3.1): their counts must match exactly
+    const countProblem = evidenceCountProblem(listed.length, evidence.length, summaryCount(summary));
     if (countProblem) return await finish(p, run, { status: "error", error: countProblem });
     const out = reconcile(lines, evidence.map(evidenceItem));
     const totals = await withDecimals(p, run.livemode, out.totals);

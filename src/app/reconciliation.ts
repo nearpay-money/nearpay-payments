@@ -191,12 +191,69 @@ export function evidenceItem(x: Execution): EvidenceItem {
     assetId: refund ? x.origin.asset_id : x.settlement.asset_id,
     amount: BigInt(refund ? (x.refund?.amount ?? "0") : (x.settled_amount ?? "0")),
     received: refund ? BigInt(x.settled_amount ?? "0") : null,
-    // rails does not report observed fees on executions yet (change request in the step report)
-    observedFee: null,
+    // spec 0.2.1: the fee rails observed (Explorer `appFees`); null keeps the day's fees incomplete (no diff)
+    observedFee: x.observed_fee ? { amount: BigInt(x.observed_fee.amount), assetId: x.observed_fee.asset_id } : null,
     paymentIntent: x.reference?.payment_intent ?? null,
     refund: x.reference?.refund ?? null,
   };
 }
+
+/**
+ * `ReconciliationTotals.decimals` (spec 0.2.1): rails `getInternalAsset` (5-minute cache), else the decimals
+ * the statement recorded for the asset; omitted when neither is known.
+ */
+export async function withDecimals<T extends { asset_id: string }>(
+  p: Payments,
+  livemode: boolean,
+  totals: readonly T[],
+): Promise<(T & { decimals?: number })[]> {
+  return Promise.all(
+    totals.map(async (t) => {
+      try {
+        const a = await p.caches.assets.get(`${livemode}|${t.asset_id}`, () => p.rails.asset(t.asset_id, livemode));
+        return { ...t, decimals: a.decimals };
+      } catch {
+        const l = await p.db
+          .selectFrom("balance_transactions")
+          .select("settlement_decimals")
+          .where("settlement_asset_id", "=", t.asset_id)
+          .where("livemode", "=", livemode)
+          .limit(1)
+          .executeTakeFirst();
+        return l ? { ...t, decimals: l.settlement_decimals } : { ...t };
+      }
+    }),
+  );
+}
+
+/**
+ * `ReconciliationRun.account_display_name` (spec 0.2.1) from the settlement-context read model (identity's
+ * `Account.display_name`, refreshed on `evt.identity.account.updated`); null when payments has none.
+ */
+async function displayNames(p: Payments, rows: readonly RunRow[]): Promise<Map<string, string>> {
+  const accounts = [...new Set(rows.map((r) => r.account_id))];
+  if (!accounts.length) return new Map();
+  const ctx = await p.db
+    .selectFrom("settlement_contexts")
+    .select(["account_id", "livemode", "context", "refreshed_at"])
+    .where("account_id", "in", accounts)
+    .orderBy("refreshed_at", "asc")
+    .execute();
+  const out = new Map<string, string>();
+  // the most recently refreshed context of the account wins (either mode carries the same account)
+  for (const c of ctx) {
+    const name = (c.context as { account?: { display_name?: unknown } }).account?.display_name;
+    if (typeof name === "string" && name) out.set(c.account_id, name);
+  }
+  return out;
+}
+
+async function runViews(p: Payments, rows: readonly RunRow[]) {
+  const names = await displayNames(p, rows);
+  return rows.map((r) => runView(r, names.get(r.account_id) ?? null));
+}
+
+const oneView = async (p: Payments, r: RunRow) => (await runViews(p, [r]))[0] as ReturnType<typeof runView>;
 
 function summaryCount(s: EvidenceSummaryResponse): number {
   return s.totals.filter((t) => t.state === "succeeded").reduce((n, t) => n + t.count, 0);
@@ -229,7 +286,8 @@ export async function executeRun(
         error: `rails evidence pages (${evidence.length}) disagree with its summary (${summaryCount(summary)})`,
       });
     const out = reconcile(lines, evidence.map(evidenceItem));
-    await finish(p, run, { status: out.diffs.length ? "diff" : "ok", totals: out.totals, diffs: out.diffs });
+    const totals = await withDecimals(p, run.livemode, out.totals);
+    await finish(p, run, { status: out.diffs.length ? "diff" : "ok", totals, diffs: out.diffs });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     if (attempt < RUN_ATTEMPTS_BEFORE_ERROR) throw e; // transient: the job retries the same run
@@ -342,7 +400,7 @@ export async function listRuns(p: Payments, q: RunListQuery) {
       .execute();
     return {
       object: "list" as const,
-      data: rows.slice(0, q.limit).reverse().map(runView),
+      data: await runViews(p, rows.slice(0, q.limit).reverse()),
       has_more: rows.length > q.limit,
       url: "/ops/reconciliation_runs",
     };
@@ -354,7 +412,7 @@ export async function listRuns(p: Payments, q: RunListQuery) {
     .execute();
   return {
     object: "list" as const,
-    data: rows.slice(0, q.limit).map(runView),
+    data: await runViews(p, rows.slice(0, q.limit)),
     has_more: rows.length > q.limit,
     url: "/ops/reconciliation_runs",
   };
@@ -371,7 +429,7 @@ async function runRow(p: Payments, id: string): Promise<RunRow> {
 }
 
 export async function getRun(p: Payments, id: string) {
-  return runView(await runRow(p, id));
+  return oneView(p, await runRow(p, id));
 }
 
 /** `POST /ops/reconciliation_runs`: completed UTC days only; one running run per account, mode and day. */
@@ -414,7 +472,7 @@ export async function createRun(
       throw new ApiError("state_conflict", { message: `A reconciliation of ${body.day} is already running.` });
     throw e;
   }
-  return runView(run);
+  return oneView(p, run);
 }
 
 /** `POST /ops/reconciliation_runs/{id}/resolution` (RB-05): once, on a completed `diff`/`error` run. */
@@ -455,5 +513,5 @@ export async function resolveRun(
     });
     return done;
   });
-  return runView(out);
+  return oneView(p, out);
 }

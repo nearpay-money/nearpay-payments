@@ -9,7 +9,7 @@ import { type Pricing, settlementEstimate } from "../domain/pricing/pricing.js";
 import { type InternalOption, upstreamCode } from "../infra/clients/peers.js";
 import { payerSession, payerView } from "./attempts.js";
 import type { Payments } from "./context.js";
-import { assetInfo, railsSettlementEstimate } from "./pricing.js";
+import { assetInfo, pricingAssetDisplay, railsSettlementEstimate } from "./pricing.js";
 import { settlementContext } from "./settlement-context.js";
 import { type AttemptRow, type IntentRow, newestFirst, publicSession, type SessionRow } from "./views.js";
 
@@ -33,12 +33,13 @@ export function currentAttempt(attempts: readonly AttemptRow[]): AttemptRow | nu
 }
 
 export async function publicSnapshot(p: Payments, s: SessionRow, i: IntentRow) {
-  const [attempts, name] = await Promise.all([
+  const [attempts, name, pricingAsset] = await Promise.all([
     p.db.selectFrom("payment_attempts").selectAll().where("payment_intent_id", "=", i.id).execute(),
     merchantName(p, s.account_id, s.livemode),
+    pricingAssetDisplay(p, i.currency, i.pricing_asset_id, s.livemode),
   ]);
   const a = currentAttempt(attempts);
-  return { session: publicSession(s, i, name, a ? payerView(p, a) : null), attempt: a };
+  return { session: publicSession(s, i, name, a ? payerView(p, a) : null, pricingAsset), attempt: a };
 }
 
 /** `GET /v1/checkout/sessions/{id}/public`. */

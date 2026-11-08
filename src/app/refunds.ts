@@ -16,7 +16,7 @@
 import type { MultiPayload } from "@nearpay/spec";
 import { getChain, validateAddress } from "@nearpay-internal/chains";
 import type { Updateable } from "@nearpay-internal/db";
-import { emit } from "@nearpay-internal/db";
+import { emit, enqueueJob } from "@nearpay-internal/db";
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import { verifySigned } from "@nearpay-internal/intents";
 import { ApiError, type ApiErrorOptions } from "@nearpay-internal/service";
@@ -29,6 +29,8 @@ import {
   signIntentAction,
 } from "../domain/refund/next-action.js";
 import {
+  type AbandonReason,
+  abandonReasonOf,
   applyDecision,
   type Budget,
   budgetOf,
@@ -72,6 +74,8 @@ import {
 } from "./views.js";
 
 export const PREPARE_RECOVERY_JOB = "refund.prepare_recovery";
+/** Asks rails to abandon an orphaned refund leg's execution (spec 0.2.1 `abandonExecution`). */
+export const ABANDON_LEG_JOB = "refund.abandon_leg";
 /** Legs younger than this are still in their own prepare call. */
 export const PREPARE_RECOVER_AFTER_MS = 20_000;
 /** How long a leg may stay `preparing` before the refund fails with `rail_timeout` (§9). */
@@ -527,6 +531,94 @@ export async function createRefund(
   return prepareAndReport(p, created.refund.id, created.leg.id, actor.id);
 }
 
+// ============================================================================================ orphaned legs
+
+/**
+ * Schedules `abandonExecution` for a leg whose execution payments no longer uses (spec 0.2.1, audit finding
+ * 6): in the transaction that made it orphaned, once per execution (job dedupe). The call itself happens
+ * outside any lock; a late deposit still arrives as an execution event and counts as `extra_amount_sent`.
+ */
+async function abandonIfOrphaned(
+  p: Payments,
+  tx: Tx,
+  o: {
+    leg: LegRow;
+    refundStatus: RefundStatus;
+    current: boolean;
+    executionId: string | null;
+    executionState: string | null;
+  },
+): Promise<AbandonReason | null> {
+  if (!o.executionId || o.leg.abandoned_at) return null;
+  const reason = abandonReasonOf({
+    legStatus: o.leg.status,
+    failureCode: o.leg.failure_code,
+    refundStatus: o.refundStatus,
+    current: o.current,
+    executionState: o.executionState,
+  });
+  if (!reason) return null;
+  const r = await enqueueJob(tx, {
+    kind: ABANDON_LEG_JOB,
+    payload: { leg: o.leg.id, execution: o.executionId, reason },
+    dedupeKey: `${ABANDON_LEG_JOB}:${o.executionId}`,
+    maxAttempts: 20,
+  });
+  if (r.inserted) p.log.info({ leg: o.leg.id, execution: o.executionId, reason }, "orphaned refund leg: abandoning");
+  return reason;
+}
+
+/** The `refund.abandon_leg` job: rails abandons the execution (idempotent); money already moved → nothing to do. */
+export async function abandonLeg(
+  p: Payments,
+  payload: { leg: string; execution: string; reason: AbandonReason },
+): Promise<void> {
+  const leg = await p.db.selectFrom("refund_legs").selectAll().where("id", "=", payload.leg).executeTakeFirst();
+  if (!leg || leg.abandoned_at) return;
+  let note: string;
+  try {
+    const x = await p.rails.abandonExecution(payload.execution, {
+      reason: payload.reason,
+      note: `leg ${leg.number} of ${fromUuid("re", leg.refund_id)} is no longer used by payments`,
+    });
+    note = `execution ${x.id} abandoned at rails (${payload.reason}): ${x.state}`;
+  } catch (e) {
+    const u = upstreamCode(e);
+    if (u.code === "state_conflict") {
+      // money moved through it: the execution keeps being tracked and its events apply to the leg (INV-3)
+      p.log.warn({ leg: leg.id, execution: payload.execution }, "orphaned refund leg not abandoned: money moved");
+      await p.db.transaction().execute(async (tx) => {
+        await legTransition(tx, leg.id, leg.status, leg.status, {
+          cause: `execution ${payload.execution} not abandoned (${payload.reason}): rails says money moved`,
+          actor: "system",
+        });
+      });
+      return;
+    }
+    if (u.code === "resource_missing") {
+      p.log.error({ leg: leg.id, execution: payload.execution }, "ALERT orphaned refund leg unknown to rails");
+      return;
+    }
+    throw e; // transient: the job retries
+  }
+  await p.db.transaction().execute(async (tx) => {
+    const cur = await tx
+      .selectFrom("refund_legs")
+      .selectAll()
+      .where("id", "=", leg.id)
+      .forUpdate()
+      .executeTakeFirstOrThrow();
+    if (cur.abandoned_at) return;
+    await updateLeg(
+      tx,
+      cur,
+      { abandoned_at: new Date(p.now()), abandon_reason: payload.reason },
+      { cause: note, actor: "system" },
+    );
+    await legTransition(tx, cur.id, cur.status, cur.status, { cause: note, actor: "system" });
+  });
+}
+
 // ============================================================================================ legs
 
 type Outcome =
@@ -607,7 +699,8 @@ async function nextActionOf(p: Payments, r: RefundRow, i: IntentRow, leg: LegRow
     if (exactInput && BigInt(t.amount) !== BigInt(leg.amount)) throw mismatch(`transfer amount ${t.amount}`);
     if (r.method === "intents_transfer" && t.receiver_id !== r.recipient)
       throw mismatch(`transfer receiver ${t.receiver_id}`);
-    const nonce = await p.nonces.fresh(r.livemode);
+    // spec 0.2.1: rails issues the nonce (salt ‖ 28 random bytes); the salt read is the fallback for rails 0.2.0
+    const nonce = t.nonce ?? (await p.nonces.fresh(r.livemode));
     return { action: signIntentAction(t, nonce, asset), nonce, deadline: new Date(t.deadline), amount: t.amount };
   }
   const dep = x.deposit;
@@ -732,6 +825,13 @@ async function failPreparation(
         actor,
       },
     );
+    await abandonIfOrphaned(p, tx, {
+      leg: failed,
+      refundStatus: l.refund.status,
+      current: l.refund.current_leg_id === legId,
+      executionId: x?.id ?? null,
+      executionState: x?.state ?? null,
+    });
     await applyLegChange(
       p,
       tx,
@@ -802,7 +902,7 @@ export async function recoverPreparing(p: Payments, legId: string): Promise<void
     p.metrics.refund("rail_timeout");
     return;
   }
-  if (r.livemode && (await killSwitchEngaged(p.db))) return; // no new live legs while engaged (§17 item 16)
+  if (r.livemode && (await killSwitchEngaged(p))) return; // no new live legs while engaged (§17 item 16)
   const out = await callRails(p, r.id, leg.id);
   if (out.kind === "ok") await linkLeg(p, leg.id, out.x, "system");
   else if (out.kind === "definitive") {
@@ -936,16 +1036,23 @@ async function applyLegExecution(p: Payments, tx: Tx, l: Locked, leg: LegRow, x:
   if (ignored) {
     // a late state that would revive a leg that is over (e.g. the create response after a cancel or a
     // recipient change, finding 6): the leg keeps its status and remembers the execution, so money that
-    // still moves through it is found and applied (INV-3). Rails has no route to abandon an execution
-    // (spec 0.2.0), so the leg records a note and the deposit instructions are never shown.
-    await updateLeg(
+    // still moves through it is found and applied (INV-3); the deposit instructions are never shown and an
+    // execution that saw no deposit is abandoned at rails (spec 0.2.1 `abandonExecution`).
+    const kept = await updateLeg(
       tx,
       leg,
       { execution_id: x.id, execution_version: x.version },
       { cause: `execution ${x.id} v${x.version}: ${x.state} ignored (leg ${leg.status})`, actor },
     );
+    const reason = await abandonIfOrphaned(p, tx, {
+      leg: kept,
+      refundStatus: l.refund.status,
+      current: l.refund.current_leg_id === leg.id,
+      executionId: x.id,
+      executionState: x.state,
+    });
     await legTransition(tx, leg.id, leg.status, leg.status, {
-      cause: `late execution ${x.id} v${x.version} (${x.state}) ignored: the leg is ${leg.status}${leg.failure_code ? ` (${leg.failure_code})` : ""}; rails cannot abandon it (no route), nothing is shown to the merchant`,
+      cause: `late execution ${x.id} v${x.version} (${x.state}) ignored: the leg is ${leg.status}${leg.failure_code ? ` (${leg.failure_code})` : ""}; ${reason ? `abandoning it at rails (${reason})` : "tracked for late money"}, nothing is shown to the merchant`,
       actor,
     });
     p.log.warn(
@@ -1046,6 +1153,16 @@ export async function prepareRefund(p: Payments, m: Merchant, id: string, actor:
       rows = await writeBudget(tx, refund.budget, rows, before, after, meta);
       refund = await updateRefund(tx, refund, { status: "requires_action", failure_code: null }, meta);
     }
+    // the replaced current leg (expired instructions, never funded) is abandoned at rails (spec 0.2.1)
+    for (const g of l.legs)
+      if (g.id === l.refund.current_leg_id)
+        await abandonIfOrphaned(p, tx, {
+          leg: g,
+          refundStatus: refund.status,
+          current: false,
+          executionId: g.execution_id,
+          executionState: null,
+        });
     const n = Math.max(0, ...l.legs.map((g) => g.number)) + 1;
     const leg = await insertLeg(tx, refund, n, { screen: refund.recipient_overridden }, meta);
     await updateRefund(tx, refund, { current_leg_id: leg.id }, meta);
@@ -1201,8 +1318,18 @@ export async function cancelRefund(p: Payments, m: Merchant, id: string, actor: 
     const meta: Meta = { cause: "canceled by the merchant", actor: actor.id };
     const before = budgetFrom(l.refund.budget, l.intent, l.attempt);
     const rows = await writeBudget(tx, l.refund.budget, l, before, release(before, BigInt(l.refund.amount)), meta);
-    for (const g of l.legs)
-      if (g.status === "preparing") await updateLeg(tx, g, { status: "failed", failure_code: "canceled" }, meta);
+    for (const g of l.legs) {
+      const after =
+        g.status === "preparing" ? await updateLeg(tx, g, { status: "failed", failure_code: "canceled" }, meta) : g;
+      // a leg canceled before any deposit is abandoned at rails (spec 0.2.1)
+      await abandonIfOrphaned(p, tx, {
+        leg: after,
+        refundStatus: "canceled",
+        current: false,
+        executionId: after.execution_id,
+        executionState: null,
+      });
+    }
     const previous = { status: l.refund.status };
     let r = await updateRefund(tx, l.refund, { status: "canceled", canceled_at: new Date(p.now()) }, meta);
     r = await emitRefundEvents(p, tx, r, rows.intent, ["evt.payments.refund.canceled"], previous);
@@ -1248,8 +1375,18 @@ export async function updateRecipient(
         throw new ApiError("amount_exceeds_refundable", { params: { refundable: refundable(before).toString() } });
       rows = await writeBudget(tx, refund.budget, rows, before, after, meta);
     }
-    for (const g of l.legs)
-      if (g.status === "preparing") await updateLeg(tx, g, { status: "failed", failure_code: "superseded" }, meta);
+    for (const g of l.legs) {
+      const after =
+        g.status === "preparing" ? await updateLeg(tx, g, { status: "failed", failure_code: "superseded" }, meta) : g;
+      // the new leg replaces every earlier one: an earlier execution that saw no deposit is abandoned (spec 0.2.1)
+      await abandonIfOrphaned(p, tx, {
+        leg: after,
+        refundStatus: refund.status,
+        current: false,
+        executionId: after.execution_id,
+        executionState: null,
+      });
+    }
     refund = await updateRefund(
       tx,
       refund,

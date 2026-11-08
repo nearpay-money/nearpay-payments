@@ -1,5 +1,5 @@
 /**
- * Kysely table types (migrations/0001_payments.sql, 0002_stage2.sql). numeric(78,0) columns read as decimal
+ * Kysely table types (migrations/0001_payments.sql, 0002_stage2.sql, 0003_audit_fixes.sql, 0004_spec_0_2_1.sql). numeric(78,0) columns read as decimal
  * strings.
  */
 import type { ColumnType, KitTables } from "@nearpay-internal/db";
@@ -53,6 +53,8 @@ export interface DepositJson {
   min_amount_in: string;
   deadline: string;
   chain: string;
+  /** Part of `amount_in` that pays NearPay's fee (rails `fee_amount_in`, spec 0.2.1); absent on older rows. */
+  fee_amount?: string | null;
 }
 
 export interface RequirementJson {
@@ -173,6 +175,8 @@ export interface PaymentAttemptsTable {
   deadline: Opt<Date>;
   settled_amount: OptNum;
   refunded_amount: OptNum;
+  /** Rails `deposited_amount` (spec 0.2.1). */
+  deposited_amount: OptNum;
   evidence: OptJson<Record<string, unknown>>;
   failure_code: Opt<string>;
   is_overpayment: Def<boolean>;
@@ -229,9 +233,22 @@ export interface CustomersTable {
   wallets: ColumnType<{ chain: string; address: string }[], string | undefined, string>;
   metadata: ColumnType<Record<string, string>, string | undefined, string>;
   deleted_at: Opt<Date>;
+  last_payment_at: Opt<Date>;
   created_at: Timestamp;
   updated_at: Timestamp;
   version: Def<number>;
+}
+
+export interface CustomerTotalsTable {
+  customer_id: string;
+  account_id: string;
+  livemode: boolean;
+  currency: string;
+  /** '' for fiat pricing. */
+  asset_id: Def<string>;
+  amount: DefNum;
+  count: Def<number>;
+  updated_at: Timestamp;
 }
 
 export interface PaymentLinksTable {
@@ -244,6 +261,7 @@ export interface PaymentLinksTable {
   pricing_asset_id: Opt<string>;
   pricing_asset_amount: OptNum;
   description: string;
+  name: Opt<string>;
   settlement_destination_id: Opt<string>;
   success_url: Opt<string>;
   max_uses: Opt<number>;
@@ -322,6 +340,8 @@ export interface RefundLegsTable {
   evidence: OptJson<Record<string, unknown>>;
   failure_code: Opt<string>;
   screen: Def<boolean>;
+  abandoned_at: Opt<Date>;
+  abandon_reason: Opt<string>;
   created_at: Timestamp;
   updated_at: Timestamp;
   version: Def<number>;
@@ -374,6 +394,7 @@ export interface PaymentsTables {
   payment_intent_transitions: TransitionsTable & { payment_intent_id: string };
   payment_attempt_transitions: TransitionsTable & { payment_attempt_id: string };
   customers: CustomersTable;
+  customer_totals: CustomerTotalsTable;
   payment_links: PaymentLinksTable;
   refunds: RefundsTable;
   refund_legs: RefundLegsTable;

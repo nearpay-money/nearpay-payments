@@ -19,6 +19,11 @@ const shared = {
   railsUrl: http(),
   agentpayUrl: http(),
   complianceUrl: http(),
+  /**
+   * Sentinel (kill-switch read at boot, spec 0.2.1). Unset: the state stays unknown until the first
+   * `evt.sentinel.kill_switch.*` arrives, and live refunds fail closed meanwhile.
+   */
+  sentinelUrl: http().optional(),
   /** Test mode (nearpay-sandbox); without it simulated deposits and test helpers are unavailable. */
   sandboxBaseUrl: http().optional(),
   /** Checkout origin; session URLs are `<origin>/c/<cs_id>#<client_secret>`. */

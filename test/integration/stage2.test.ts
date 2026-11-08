@@ -13,8 +13,9 @@ import { createRefundExecution, relaySignedIntent } from "@nearpay-internal/spec
 import { domainEvent, expectEvent, mockError } from "@nearpay-internal/testing";
 import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { syncKillSwitchAtBoot } from "../../src/app/kill-switch.js";
 import { valkeyLimiter } from "../../src/infra/rate-limiter.js";
-import { type Merchant, type Stack, startStack, USDC_NEAR, uuid } from "../support/stack.js";
+import { type Merchant, type Stack, startStack, USDC_BASE, USDC_NEAR, uuid } from "../support/stack.js";
 import { agentpayRelayBody, type Evidence, freshEvidence, type PaidIntent } from "../support/stage2.js";
 
 let st: Stack;
@@ -1162,8 +1163,18 @@ describe("audit fixes (lld/payments.md §18)", () => {
         .where("refund_leg_id", "=", leg.id)
         .where("from_state", "=", "failed")
         .where("to_state", "=", "failed")
+        .where("cause", "like", "%ignored%")
         .executeTakeFirst();
       expect(note?.cause).toMatch(/ignored/);
+      // spec 0.2.1: the orphaned execution is abandoned at rails
+      expect(note?.cause).toMatch(/abandoning it at rails \(refund_canceled\)/);
+      await waitFor(async () => st.abandoned.find((a) => a.id === leg.execution_id));
+      expect(st.abandoned.find((a) => a.id === leg.execution_id)?.reason).toBe("refund_canceled");
+      const done = await waitFor(async () => {
+        const l = await st.admin.db.selectFrom("refund_legs").selectAll().where("id", "=", leg.id).executeTakeFirst();
+        return l?.abandoned_at ? l : null;
+      });
+      expect(done).toMatchObject({ status: "failed", abandon_reason: "refund_canceled" });
     } finally {
       st.onRefundCreate(null);
       release();
@@ -1185,6 +1196,8 @@ describe("audit fixes (lld/payments.md §18)", () => {
       expect(bad.body.error.code).toBe("rail_unavailable");
       const [r] = (await st.call("GET", `/v1/refunds?payment_intent=${paid.pi}`, { token: paid.token })).body.data;
       expect(r).toMatchObject({ status: "failed", failure_code: "execution_mismatch", next_action: null });
+      const badEx = await legExecution(r.id);
+      await waitFor(async () => st.abandoned.find((a) => a.id === badEx && a.reason === "execution_mismatch"));
       expect(JSON.stringify(r)).not.toContain("evil.near");
       expect(
         (await st.call("GET", `/v1/payment_intents/${paid.pi}`, { token: paid.token })).body.amount_refund_pending,
@@ -1206,5 +1219,328 @@ describe("audit fixes (lld/payments.md §18)", () => {
     } finally {
       st.onRefundCreate(null);
     }
+  });
+});
+
+// ==================================================================================== spec 0.2.1
+
+describe('spec 0.2.1 (lld/payments.md §"Spec 0.2.1 contract changes")', () => {
+  const killSwitchRow = () => st.admin.db.selectFrom("kill_switch").selectAll().executeTakeFirst();
+
+  it("kill switch read from sentinel when unknown; its version decides which events still apply", async () => {
+    const m = st.merchant({ livemode: true });
+    const paid = await paidIntent(m, { livemode: true });
+    const refund = () =>
+      st.call("POST", "/v1/refunds", { token: paid.token, body: { payment_intent: paid.pi, amount: "1000" } });
+    try {
+      // sentinel down and nothing stored: unknown → fail closed
+      await st.admin.db.deleteFrom("kill_switch").execute();
+      st.killSwitchRead = null;
+      expect(await syncKillSwitchAtBoot(st.payments)).toBe("unknown");
+      // (the envelope carries code + message only; `params` just render the catalogue message)
+      const unknown = await refund();
+      expect(unknown.status).toBe(503);
+      expect(unknown.body.error.code).toBe("rail_unavailable");
+      expect(unknown.body.error.message).toMatch(/state is known/);
+      // boot read: released at version 5000
+      st.killSwitchRead = { engaged: false, version: 5000, reason: "normal" };
+      expect(await syncKillSwitchAtBoot(st.payments)).toBe("released");
+      expect(await killSwitchRow()).toMatchObject({ engaged: false, version: 5000 });
+      expect((await refund()).status).toBe(201);
+      // an older event is ignored, a newer one applies
+      const ev = (engaged: boolean, version: number, reason: string) =>
+        st.publishEvent(
+          domainEvent(
+            engaged ? "evt.sentinel.kill_switch.engaged" : "evt.sentinel.kill_switch.released",
+            { engaged, reason, actor: "ops" },
+            { accountUuid: null, livemode: true, version },
+          ),
+        );
+      await ev(true, 4999, "stale");
+      await ev(true, 5001, "drill");
+      await waitFor(async () => (await killSwitchRow())?.version === 5001);
+      expect(await killSwitchRow()).toMatchObject({ engaged: true, reason: "drill" });
+      // a stored state is never replaced by a read
+      st.killSwitchRead = { engaged: false, version: 1, reason: "old" };
+      expect(await syncKillSwitchAtBoot(st.payments)).toBe("engaged");
+      // sentinel 0.2.0 sends no version: stored as 0, so any event replaces it
+      await st.admin.db.deleteFrom("kill_switch").execute();
+      st.killSwitchRead = { engaged: true, reason: "no version" };
+      expect(await syncKillSwitchAtBoot(st.payments)).toBe("engaged");
+      expect((await killSwitchRow())?.version).toBe(0);
+      const engaged = await refund();
+      expect(engaged.status).toBe(503);
+      expect(engaged.body.error.message).toMatch(/kill switch is engaged/);
+      await ev(false, 1, "released");
+      await waitFor(async () => (await killSwitchRow())?.engaged === false);
+      expect((await refund()).status).toBe(201);
+    } finally {
+      st.killSwitchRead = null;
+    }
+  });
+
+  it("legs canceled or replaced before any deposit are abandoned; money moved → rails keeps them", async () => {
+    const paid = await paidIntent();
+    const r = await st.call("POST", "/v1/refunds", {
+      token: paid.token,
+      body: { payment_intent: paid.pi, amount: "300000" },
+    });
+    expect(r.body.status).toBe("requires_action");
+    const ex1 = await legExecution(r.body.id);
+    expect((await st.call("POST", `/v1/refunds/${r.body.id}/cancel`, { token: paid.token, body: {} })).status).toBe(
+      200,
+    );
+    await waitFor(async () => st.abandoned.find((a) => a.id === ex1 && a.reason === "refund_canceled"));
+    // rails' expired_unpaid event closes the leg; the canceled refund is unchanged
+    await railsEvent(paid.m, ex1, { state: "expired_unpaid" });
+    await waitFor(async () => {
+      const l = await st.admin.db
+        .selectFrom("refund_legs")
+        .selectAll()
+        .where("execution_id", "=", ex1)
+        .executeTakeFirst();
+      return l?.status === "expired" && l.abandoned_at ? l : null;
+    });
+    expect((await st.call("GET", `/v1/refunds/${r.body.id}`, { token: paid.token })).body.status).toBe("canceled");
+
+    // recipient override replaces a leg waiting for its signature: superseded
+    const r2 = await st.call("POST", "/v1/refunds", {
+      token: paid.token,
+      body: { payment_intent: paid.pi, amount: "300000" },
+    });
+    const ex2 = await legExecution(r2.body.id);
+    const owner = await st.sessionToken(paid.m, { role: "owner", stepUp: true });
+    const o = await st.call("POST", `/v1/refunds/${r2.body.id}/recipient`, {
+      token: owner,
+      body: { address: "other.near", reason: "payer asked" },
+    });
+    expect(o.status).toBe(200);
+    await waitFor(async () => st.abandoned.find((a) => a.id === ex2 && a.reason === "superseded"));
+
+    // money moved before the abandon reached rails: 409, the leg stays tracked (INV-3)
+    const r3 = await st.call("POST", "/v1/refunds", {
+      token: paid.token,
+      body: { payment_intent: paid.pi, amount: "300000" },
+    });
+    const ex3 = await legExecution(r3.body.id);
+    st.advance(ex3, { state: "deposit_detected" } as never);
+    await st.call("POST", `/v1/refunds/${r3.body.id}/cancel`, { token: paid.token, body: {} });
+    await waitFor(async () => st.abandoned.find((a) => a.id === ex3));
+    const leg3 = await waitFor(async () => {
+      const l = await st.admin.db
+        .selectFrom("refund_legs")
+        .select(["id", "abandoned_at"])
+        .where("execution_id", "=", ex3)
+        .executeTakeFirstOrThrow();
+      const n = await st.admin.db
+        .selectFrom("refund_leg_transitions")
+        .select("cause")
+        .where("refund_leg_id", "=", l.id)
+        .where("cause", "like", "%not abandoned%")
+        .executeTakeFirst();
+      return n ? l : null;
+    });
+    expect(leg3.abandoned_at).toBeNull();
+  });
+
+  it("sign_intent legs use the nonce rails issues (salt read only without it)", async () => {
+    const nonce = Buffer.concat([Buffer.from("5a0dbe11", "hex"), randomBytes(28)]).toString("base64");
+    st.refundNonce = nonce;
+    try {
+      const paid = await paidIntent();
+      const r = await st.call("POST", "/v1/refunds", {
+        token: paid.token,
+        body: { payment_intent: paid.pi, amount: "1000" },
+      });
+      expect(r.body.next_action.nep413.nonce).toBe(nonce);
+      expect(JSON.parse(r.body.next_action.payload).nonce).toBe(nonce);
+      const leg = await st.admin.db
+        .selectFrom("refund_legs")
+        .select("signed_nonce")
+        .where("refund_id", "=", uuid(r.body.id, "re"))
+        .executeTakeFirstOrThrow();
+      expect(leg.signed_nonce).toBe(nonce);
+    } finally {
+      st.refundNonce = null;
+    }
+    const fallback = await paidIntent();
+    const r = await st.call("POST", "/v1/refunds", {
+      token: fallback.token,
+      body: { payment_intent: fallback.pi, amount: "1000" },
+    });
+    expect(r.body.next_action.nep413.nonce).not.toBe(nonce);
+  });
+
+  it("payer and merchant views: deposit fee, amount received, refund_to, pricing asset, link name", async () => {
+    const m = st.merchant();
+    const token = await st.token(m);
+    const s = await st.call("POST", "/v1/checkout/sessions", {
+      token,
+      body: { amount: "2000000", currency: "asset", asset_id: USDC_NEAR, success_url: "https://shop.example/t" },
+    });
+    expect(s.status).toBe(201);
+    const a = await st.call("POST", `/v1/checkout/sessions/${s.body.id}/public/attempts`, {
+      secret: s.body.client_secret,
+      body: {
+        method: "route_quote",
+        origin_asset_id: USDC_BASE,
+        refund_to: "0x2222222222222222222222222222222222222222",
+        turnstile_token: "t",
+      },
+    });
+    expect(a.status).toBe(201);
+    expect(a.body.deposit).toMatchObject({ amount_in: "2010042", fee_amount: "10042" });
+    expect(a.body.amount_received).toBeNull();
+    const pub = await st.call("GET", `/v1/checkout/sessions/${s.body.id}/public`, { secret: s.body.client_secret });
+    expect(pub.body.pricing_asset).toEqual({ asset_id: USDC_NEAR, symbol: "USDC", decimals: 6 });
+    const row = await st.admin.db
+      .selectFrom("payment_attempts")
+      .select("execution_id")
+      .where("id", "=", uuid(a.body.id, "pa"))
+      .executeTakeFirstOrThrow();
+    await railsEvent(m, row.execution_id as string, { state: "incomplete_deposit", deposited_amount: "1500000" });
+    await waitFor(
+      async () =>
+        (await st.call("GET", `/v1/checkout/sessions/${s.body.id}/public`, { secret: s.body.client_secret })).body
+          .attempt?.amount_received === "1500000",
+    );
+    const pi = await st.call("GET", `/v1/payment_intents/${s.body.payment_intent}`, { token });
+    expect(pi.body.attempts[0]).toMatchObject({
+      origin_amount: "1500000",
+      refund_to: "0x2222222222222222222222222222222222222222",
+    });
+    const fiat = await st.call("POST", "/v1/checkout/sessions", {
+      token,
+      body: { amount: 200, currency: "usd", success_url: "https://shop.example/t" },
+    });
+    expect(
+      (await st.call("GET", `/v1/checkout/sessions/${fiat.body.id}/public`, { secret: fiat.body.client_secret })).body
+        .pricing_asset,
+    ).toBeNull();
+
+    // links: name on create / update / read (never on the public link), pricing asset on the public link
+    const l = await st.call("POST", "/v1/payment_links", {
+      token,
+      body: { amount: "2000000", currency: "asset", asset_id: USDC_NEAR, description: "Beans", name: "Spring promo" },
+    });
+    expect(l.status).toBe(201);
+    expect(l.body.name).toBe("Spring promo");
+    const up = await st.call("PATCH", `/v1/payment_links/${l.body.id}`, { token, body: { name: "Summer promo" } });
+    expect(up.body.name).toBe("Summer promo");
+    expect((await st.call("GET", `/v1/payment_links/${l.body.id}`, { token })).body.name).toBe("Summer promo");
+    expect(
+      (await st.call("PATCH", `/v1/payment_links/${l.body.id}`, { token, body: { name: null } })).body.name,
+    ).toBeNull();
+    const pl = await st.call("GET", `/v1/payment_links/${l.body.id}/public`);
+    expect(pl.body.pricing_asset).toEqual({ asset_id: USDC_NEAR, symbol: "USDC", decimals: 6 });
+    expect(pl.body).not.toHaveProperty("name");
+  });
+
+  it("customer total_paid: succeeded intents per currency, concurrent payments, refunds not subtracted", async () => {
+    const m = st.merchant();
+    const token = await st.token(m);
+    const c = await st.call("POST", "/v1/customers", { token, body: { email: "tot@example.com" } });
+    expect(c.body).toMatchObject({ total_paid: [], last_payment_at: null });
+    const n = 4;
+    const paid = await Promise.all(Array.from({ length: n }, () => paidIntent(m, { body: { customer: c.body.id } })));
+    await paidIntent(m, { body: { customer: c.body.id, amount: 300, currency: "eur" } });
+    await paidIntent(m); // no customer
+    const v = (await st.call("GET", `/v1/customers/${c.body.id}`, { token })).body;
+    expect(v.total_paid).toEqual([
+      { currency: "eur", asset_id: null, amount: 300, count: 1 },
+      { currency: "usd", asset_id: null, amount: 200 * n, count: n },
+    ]);
+    expect(v.last_payment_at).toBeGreaterThan(0);
+    // a refund that succeeds does not change the totals
+    const p0 = paid[0] as PaidIntent;
+    const r = await st.call("POST", "/v1/refunds", { token, body: { payment_intent: p0.pi, amount: "1000000" } });
+    const ex = await legExecution(r.body.id);
+    await railsEvent(
+      m,
+      ex,
+      {
+        state: "succeeded",
+        settled_amount: "1000000",
+        evidence: freshEvidence("payer.near", "1000000"),
+        terminal_at: new Date().toISOString(),
+      },
+      "evt.rails.execution.settled",
+    );
+    await waitFor(
+      async () => (await st.call("GET", `/v1/refunds/${r.body.id}`, { token })).body.status === "succeeded",
+    );
+    const after = (await st.call("GET", `/v1/customers/${c.body.id}`, { token })).body;
+    expect(after.total_paid).toEqual(v.total_paid);
+    expect((await st.call("GET", `/v1/customers?email=tot%40example.com`, { token })).body.data[0].total_paid).toEqual(
+      v.total_paid,
+    );
+    // the stored totals equal the recomputed sum
+    const sum = await st.admin.db
+      .selectFrom("payment_intents")
+      .select((eb) => [eb.fn.sum<string>("amount").as("amount"), eb.fn.countAll<string>().as("count")])
+      .where("customer_id", "=", uuid(c.body.id, "cus"))
+      .where("status", "=", "succeeded")
+      .where("currency", "=", "usd")
+      .executeTakeFirstOrThrow();
+    expect({ amount: Number(sum.amount), count: Number(sum.count) }).toEqual({ amount: 200 * n, count: n });
+  });
+
+  it("reconciliation: observed fees, fee_mismatch, incomplete fees, decimals and account display name", async () => {
+    const day = yesterday().toISOString().slice(0, 10);
+    const ops = await st.opsToken();
+    const runOf = async (account: string) => {
+      const run = await st.call("POST", "/ops/reconciliation_runs", {
+        token: ops,
+        body: { account_id: account, livemode: false, day },
+      });
+      expect(run.body.error ?? null).toBeNull();
+      return waitFor(async () => {
+        const v = (await st.call("GET", `/ops/reconciliation_runs/${run.body.id}`, { token: ops })).body;
+        return v.status !== "running" ? v : null;
+      }, 30_000);
+    };
+    const feeOf = async (pi: string) =>
+      (
+        await st.admin.db
+          .selectFrom("balance_transactions")
+          .select(["fee_amount_est", "fee_asset_id"])
+          .where("payment_intent_id", "=", uuid(pi, "pi"))
+          .where("type", "=", "payment")
+          .executeTakeFirstOrThrow()
+      ).fee_amount_est as string;
+    const observe = (exId: string, amount: string | null) => {
+      const x = st.executions.get(exId);
+      st.executions.set(exId, {
+        ...x,
+        observed_fee: amount === null ? null : { amount, asset_id: USDC_NEAR },
+      } as never);
+    };
+
+    // every execution reports its fee and it matches: ok, observed filled
+    const a = await paidIntent();
+    observe(a.exId, await feeOf(a.pi));
+    const ok = await runOf(a.m.account);
+    expect(ok).toMatchObject({ status: "ok", account_display_name: "Acme Coffee" });
+    expect(ok.totals[0]).toMatchObject({
+      decimals: 6,
+      fees: { expected: await feeOf(a.pi), observed: await feeOf(a.pi) },
+    });
+
+    // observed differs: fee_mismatch
+    const b = await paidIntent();
+    observe(b.exId, (BigInt(await feeOf(b.pi)) + 1n).toString());
+    const diff = await runOf(b.m.account);
+    expect(diff.status).toBe("diff");
+    expect(diff.diffs).toEqual([expect.objectContaining({ kind: "fee_mismatch", asset_id: USDC_NEAR })]);
+
+    // one execution without an observed fee: fees incomplete (observed null), not a diff
+    const mc = st.merchant();
+    const c1 = await paidIntent(mc);
+    const c2 = await paidIntent(mc);
+    observe(c1.exId, "1");
+    observe(c2.exId, null);
+    const inc = await runOf(mc.account);
+    expect(inc).toMatchObject({ status: "ok", diff_count: 0 });
+    expect(inc.totals[0].fees.observed).toBeNull();
   });
 });

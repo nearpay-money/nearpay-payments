@@ -7,6 +7,7 @@
  * | attempt.quoting_recovery | every 15 s                              | re-ask rails for attempts stuck in `quoting` > 20 s; fail after 2 min |
  * | context.refresh          | on identity events; sweep every 5 min   | refresh settlement contexts (backstop to events) |
  * | refund.prepare_recovery  | every 15 s                              | re-ask rails for refund legs stuck in `preparing` > 20 s; fail after 2 min |
+ * | refund.abandon_leg       | when a leg is orphaned before any deposit | rails `abandonExecution` (spec 0.2.1)  |
  * | reconcile.daily          | 02:00 UTC                               | one reconcile.run per account/mode with activity yesterday |
  * | reconcile.run            | per account day, or per ops run         | statement vs rails evidence → append-only run |
  * | reconcile.case           | after a diff/error run                  | open the compliance `reconciliation_diff` case |
@@ -23,7 +24,13 @@ import {
   runJob,
   scheduleDaily,
 } from "../app/reconciliation.js";
-import { PREPARE_RECOVER_AFTER_MS, PREPARE_RECOVERY_JOB, recoverPreparing } from "../app/refunds.js";
+import {
+  ABANDON_LEG_JOB,
+  abandonLeg,
+  PREPARE_RECOVER_AFTER_MS,
+  PREPARE_RECOVERY_JOB,
+  recoverPreparing,
+} from "../app/refunds.js";
 import { expireAtDeadline, SESSION_EXPIRE_JOB } from "../app/sessions.js";
 import { refreshContext } from "../app/settlement-context.js";
 import { CONTEXT_REFRESH_JOB } from "../consumers/handlers.js";
@@ -73,6 +80,13 @@ export function jobHandlers(p: Payments): Record<string, JobHandler> {
         }
       }
       await notify(p, touched);
+    },
+
+    [ABANDON_LEG_JOB]: async (payload) => {
+      const o = payload as { leg?: unknown; execution?: unknown; reason?: unknown } | null;
+      if (typeof o?.leg !== "string" || typeof o.execution !== "string" || typeof o.reason !== "string")
+        throw new Error("refund.abandon_leg payload without leg, execution and reason");
+      await abandonLeg(p, { leg: o.leg, execution: o.execution, reason: o.reason as never });
     },
 
     [CONTEXT_REFRESH_JOB]: async (payload) => {

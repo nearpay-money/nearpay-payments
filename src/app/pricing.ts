@@ -13,6 +13,7 @@ import { type AssetInfo, type Pricing, pricingUsdMicros } from "../domain/pricin
 import { upstreamCode } from "../infra/clients/peers.js";
 import type { Payments } from "./context.js";
 import type { Context } from "./settlement-context.js";
+import type { PricingAssetDisplay } from "./views.js";
 
 export interface PriceInput {
   readonly amount: number | string;
@@ -28,6 +29,29 @@ export async function assetInfo(p: Payments, assetId: string, livemode: boolean)
   } catch (e) {
     p.log.warn({ asset: assetId, err: e instanceof Error ? e.message : String(e) }, "rails asset lookup failed");
     throw new ApiError("rail_unavailable", { params: { reason: "asset lookup failed" } });
+  }
+}
+
+/**
+ * `pricing_asset` of a public session or link (spec 0.2.1): null for fiat pricing; omitted (undefined) when
+ * rails cannot describe the asset right now, so the payer page falls back to the raw amount.
+ */
+export async function pricingAssetDisplay(
+  p: Payments,
+  currency: string,
+  assetId: string | null,
+  livemode: boolean,
+): Promise<PricingAssetDisplay | null | undefined> {
+  if (currency !== "asset" || !assetId) return null;
+  try {
+    const a = await p.caches.assets.get(`${livemode}|${assetId}`, () => p.rails.asset(assetId, livemode));
+    return { asset_id: assetId, symbol: a.symbol, decimals: a.decimals };
+  } catch (e) {
+    p.log.warn(
+      { asset: assetId, err: e instanceof Error ? e.message : String(e) },
+      "pricing asset display unavailable",
+    );
+    return undefined;
   }
 }
 

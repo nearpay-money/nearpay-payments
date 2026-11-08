@@ -393,3 +393,36 @@ export function applyDecision(
   if (d.duplicate) next = { ...next, extra: next.extra + legAmount };
   return { book: next, budget: b };
 }
+
+// ------------------------------------------------------------------------------------------- orphaned legs
+
+/** Rails `abandonExecution` reasons (spec 0.2.1). */
+export type AbandonReason = "leg_failed" | "execution_mismatch" | "superseded" | "refund_canceled";
+
+/** Execution states before any deposit: the only ones rails abandons (money moved → `409 state_conflict`). */
+const PRE_DEPOSIT = new Set(["quoting", "awaiting_deposit"]);
+
+/**
+ * Why a refund leg's execution is orphaned and should be abandoned at rails (lld/payments.md §"Spec 0.2.1
+ * contract changes", audit finding 6), or null while payments still uses it or money may have moved.
+ * `executionState` is the execution's latest known state (null: only the leg's own status is known; a leg
+ * still `awaiting_signature` has seen no deposit).
+ */
+export function abandonReasonOf(o: {
+  readonly legStatus: LegStatus;
+  readonly failureCode: string | null;
+  readonly refundStatus: RefundStatus;
+  readonly current: boolean;
+  readonly executionState: string | null;
+}): AbandonReason | null {
+  if (o.executionState !== null && !PRE_DEPOSIT.has(o.executionState)) return null;
+  // the leg's own status says a deposit may have happened (or a payload was relayed)
+  if (o.executionState === null && o.legStatus !== "awaiting_signature" && !LEG_TERMINAL.has(o.legStatus)) return null;
+  if (MONEY_MOVED.has(o.legStatus) || o.legStatus === "submitted" || o.legStatus === "submitting") return null;
+  if (o.refundStatus === "canceled" || o.failureCode === "canceled") return "refund_canceled";
+  if (o.failureCode === "execution_mismatch") return "execution_mismatch";
+  if (o.failureCode === "superseded") return "superseded";
+  if (o.legStatus === "awaiting_signature") return o.current ? null : "superseded";
+  if (o.legStatus === "failed" || o.legStatus === "expired") return "leg_failed";
+  return null;
+}

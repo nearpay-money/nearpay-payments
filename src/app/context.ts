@@ -12,6 +12,7 @@ import type {
   InternalAsset,
   Rails,
   Sandbox,
+  Sentinel,
 } from "../infra/clients/peers.js";
 import type { Turnstile } from "../infra/clients/turnstile.js";
 import type { DB } from "../infra/db/schema.js";
@@ -110,6 +111,8 @@ export interface Payments {
   readonly rails: Rails;
   readonly agentpay: Agentpay;
   readonly compliance: Compliance;
+  /** Kill-switch reads (spec 0.2.1); null when `NP_SENTINEL_URL` is unset. */
+  readonly sentinel: Sentinel | null;
   /** Test mode only (nearpay-sandbox): simulated deposits and test helpers. */
   readonly sandbox: Sandbox | null;
   readonly turnstile: Turnstile;

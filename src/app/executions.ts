@@ -32,12 +32,16 @@ export function attemptPatch(x: Execution): Updateable<PaymentAttemptsTable> {
           min_amount_in: x.deposit.min_amount_in,
           deadline: x.deposit.deadline,
           chain: x.deposit.chain,
+          // spec 0.2.1: NearPay's share of `amount_in` (display only); absent from rails 0.2.0 → null
+          fee_amount: x.deposit.fee_amount_in ?? null,
         })
       : null,
     intents_requirement: x.intents_requirement ? JSON.stringify(x.intents_requirement) : null,
     deadline: new Date(x.deadline),
     settled_amount: x.settled_amount,
     refunded_amount: x.refunded_amount,
+    // spec 0.2.1: what the payer's deposit delivered; a newer execution without it keeps the known amount
+    ...(x.deposited_amount !== undefined ? { deposited_amount: x.deposited_amount } : {}),
     evidence: x.evidence ? JSON.stringify(x.evidence) : null,
     failure_code: x.failure_code ?? x.held_reason ?? x.refund_reason ?? null,
   };

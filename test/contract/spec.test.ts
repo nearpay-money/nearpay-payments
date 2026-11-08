@@ -140,6 +140,38 @@ describe("objects", () => {
     expect(PublicCheckoutSession.safeParse(pre015).success).toBe(false);
     expect(JSON.stringify(pub)).not.toContain("acme.near");
   });
+
+  it("spec 0.2.1 payer fields: deposit fee, amount received, pricing asset, attempt summary", () => {
+    const i = intentRow({
+      status: "processing",
+      currency: "asset",
+      amount: null,
+      pricing_asset_id: USDC_NEAR,
+      pricing_asset_amount: "2000000",
+    });
+    const row = attemptRow(i, { status: "deposit_detected", deposited_amount: "2000000" });
+    const d = row.deposit as NonNullable<typeof row.deposit>;
+    const a = payerAttempt({ ...row, deposit: { ...d, fee_amount: "10042" } }, "abc.def");
+    expect(PayerAttempt.parse(a)).toMatchObject({ amount_received: "2000000", deposit: { fee_amount: "10042" } });
+    // a deposit stored before 0.2.1 has no fee: null (unknown)
+    expect(PayerAttempt.parse(payerAttempt(row, null)).deposit?.fee_amount).toBeNull();
+    const pub = publicSession(sessionRow(i, { status: "open", completed_at: null }), i, "Acme Coffee", a, {
+      asset_id: USDC_NEAR,
+      symbol: "USDC",
+      decimals: 6,
+    });
+    expect(PublicCheckoutSession.parse(pub).pricing_asset).toEqual({
+      asset_id: USDC_NEAR,
+      symbol: "USDC",
+      decimals: 6,
+    });
+    const fiat = publicSession(sessionRow(i), intentRow(), "Acme Coffee", null, null);
+    expect(PublicCheckoutSession.parse(fiat).pricing_asset).toBeNull();
+    // unknown (rails down): omitted
+    expect(publicSession(sessionRow(i), i, "Acme Coffee", null)).not.toHaveProperty("pricing_asset");
+    const v = PaymentIntent.parse(intentView(i, [row], null));
+    expect(v.attempts[0]).toMatchObject({ origin_amount: "2000000", refund_to: row.refund_to });
+  });
 });
 
 // ---- stage 2 objects (spec 0.2.0)
@@ -228,6 +260,7 @@ describe("stage 2 objects", () => {
         pricing_asset_id: null,
         pricing_asset_amount: null,
         description: "Tea",
+        name: "Tea counter",
         settlement_destination_id: null,
         success_url: null,
         max_uses: 3,
@@ -241,7 +274,10 @@ describe("stage 2 objects", () => {
       },
       "https://pay.nearpay.localhost",
     );
-    expect(PaymentLink.parse(link).url).toBe(`https://pay.nearpay.localhost/l/${link.id}`);
+    expect(PaymentLink.parse(link)).toMatchObject({
+      url: `https://pay.nearpay.localhost/l/${link.id}`,
+      name: "Tea counter",
+    });
     const cus = customerView(
       {
         id: uuidv7(),
@@ -254,13 +290,42 @@ describe("stage 2 objects", () => {
         wallets: [{ chain: "near:mainnet", address: "a.near" }],
         metadata: {},
         deleted_at: null,
+        last_payment_at: now,
         created_at: now,
         updated_at: now,
         version: 1,
       },
       { email: "ann@example.com", name: "Ann" },
+      [
+        {
+          customer_id: uuidv7(),
+          account_id: i.account_id,
+          livemode: false,
+          currency: "usd",
+          asset_id: "",
+          amount: "12345",
+          count: 2,
+          updated_at: now,
+        },
+        {
+          customer_id: uuidv7(),
+          account_id: i.account_id,
+          livemode: false,
+          currency: "asset",
+          asset_id: USDC_NEAR,
+          amount: "123456789012345678901234567890",
+          count: 1,
+          updated_at: now,
+        },
+      ],
     );
-    expect(Customer.safeParse(cus).success).toBe(true);
+    expect(Customer.parse(cus)).toMatchObject({
+      total_paid: [
+        { currency: "asset", asset_id: USDC_NEAR, amount: "123456789012345678901234567890", count: 1 },
+        { currency: "usd", asset_id: null, amount: 12345, count: 2 },
+      ],
+      last_payment_at: Math.floor(now.getTime() / 1000),
+    });
     const line = lineView({
       id: uuidv7(),
       account_id: i.account_id,
@@ -287,35 +352,51 @@ describe("stage 2 objects", () => {
       created_at: now,
     });
     expect(BalanceTransaction.parse(line)).toMatchObject({ refund_leg: 2, received: { amount: "99" } });
-    const run = runView({
-      id: uuidv7(),
-      account_id: i.account_id,
-      livemode: false,
-      day: new Date(2026, 10, 7) as never,
-      status: "diff",
-      trigger: "schedule",
-      rerun_of: null,
-      totals: [],
-      diffs: [
-        {
-          kind: "missing_evidence",
-          asset_id: USDC_NEAR,
-          execution_id: null,
-          balance_transaction: null,
-          payment_intent: null,
-          refund: null,
-          statement_amount: "1",
-          evidence_amount: null,
-          detail: "x",
-        },
-      ],
-      error: null,
-      resolution: null,
-      case_id: null,
-      created_by: "system",
-      started_at: now,
-      completed_at: now,
+    const run = runView(
+      {
+        id: uuidv7(),
+        account_id: i.account_id,
+        livemode: false,
+        day: new Date(2026, 10, 7) as never,
+        status: "diff",
+        trigger: "schedule",
+        rerun_of: null,
+        totals: [
+          {
+            asset_id: USDC_NEAR,
+            decimals: 6,
+            inflow: { statement: "1", evidence: "0", statement_lines: 1, executions: 0 },
+            outflow: { statement: "0", evidence: "0", statement_lines: 0, executions: 0 },
+            fees: { expected: "0", observed: null },
+          },
+        ],
+        diffs: [
+          {
+            kind: "missing_evidence",
+            asset_id: USDC_NEAR,
+            execution_id: null,
+            balance_transaction: null,
+            payment_intent: null,
+            refund: null,
+            statement_amount: "1",
+            evidence_amount: null,
+            detail: "x",
+          },
+        ],
+        error: null,
+        resolution: null,
+        case_id: null,
+        created_by: "system",
+        started_at: now,
+        completed_at: now,
+      },
+      "Acme Coffee",
+    );
+    expect(ReconciliationRun.parse(run)).toMatchObject({
+      day: "2026-11-07",
+      diff_count: 1,
+      account_display_name: "Acme Coffee",
+      totals: [{ decimals: 6 }],
     });
-    expect(ReconciliationRun.parse(run)).toMatchObject({ day: "2026-11-07", diff_count: 1 });
   });
 });

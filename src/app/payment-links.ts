@@ -12,7 +12,7 @@ import { ipPrefix, type Limit } from "../domain/payment-link/rate-limit.js";
 import type { Payments } from "./context.js";
 import { type PageQuery, pageOf } from "./pages.js";
 import { merchantName } from "./payer.js";
-import { pickDestination, validatePrice } from "./pricing.js";
+import { pickDestination, pricingAssetDisplay, validatePrice } from "./pricing.js";
 import { type Merchant, openSession } from "./sessions.js";
 import { settlementContext } from "./settlement-context.js";
 import { type LinkRow, linkView } from "./views.js";
@@ -22,6 +22,7 @@ export interface LinkCreate {
   readonly currency: string;
   readonly asset_id?: string | undefined;
   readonly description: string;
+  readonly name?: string | null | undefined;
   readonly settlement_destination?: string | undefined;
   readonly success_url?: string | undefined;
   readonly session_expires_in?: number | undefined;
@@ -47,6 +48,7 @@ export async function createLink(p: Payments, m: Merchant, body: LinkCreate) {
       pricing_asset_id: asset ? (body.asset_id as string) : null,
       pricing_asset_amount: asset ? String(body.amount) : null,
       description: body.description,
+      name: body.name ?? null,
       settlement_destination_id: body.settlement_destination ?? null,
       success_url: body.success_url ?? null,
       max_uses: body.max_uses ?? null,
@@ -95,6 +97,7 @@ export async function listLinks(p: Payments, m: Merchant, q: PageQuery & { activ
 export interface LinkPatch {
   readonly active?: boolean | undefined;
   readonly description?: string | undefined;
+  readonly name?: string | null | undefined;
   readonly success_url?: string | null | undefined;
   readonly max_uses?: number | null | undefined;
   readonly collect_email?: boolean | undefined;
@@ -107,6 +110,7 @@ export async function updateLink(p: Payments, m: Merchant, id: string, body: Lin
   const patch: Record<string, unknown> = {};
   if (body.active !== undefined) patch.active = body.active;
   if (body.description !== undefined) patch.description = body.description;
+  if (body.name !== undefined) patch.name = body.name;
   if (body.success_url !== undefined) patch.success_url = body.success_url;
   if (body.max_uses !== undefined) patch.max_uses = body.max_uses;
   if (body.collect_email !== undefined) patch.collect_email = body.collect_email;
@@ -141,6 +145,7 @@ export async function getPublicLink(p: Payments, id: string) {
   } catch {
     if (!name) name = await merchantName(p, l.account_id, l.livemode).catch(() => "");
   }
+  const pricingAsset = await pricingAssetDisplay(p, l.currency, l.pricing_asset_id, l.livemode);
   return {
     id: fromUuid("plink", l.id),
     object: "payment_link" as const,
@@ -152,6 +157,7 @@ export async function getPublicLink(p: Payments, id: string) {
     display: { merchant_name_unverified: name, description: l.description },
     settlement,
     collect_email: l.collect_email,
+    ...(pricingAsset !== undefined ? { pricing_asset: pricingAsset } : {}),
   };
 }
 

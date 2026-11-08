@@ -280,7 +280,7 @@ const assetOf = (i: IntentRow) => ({ id: i.settlement_asset_id, decimals: i.sett
 
 // ============================================================================================ reads
 
-async function viewOf(p: Payments, r: RefundRow) {
+async function viewOf(p: Payments, r: RefundRow, o: { relaying?: boolean } = {}) {
   const [legs, intent] = await Promise.all([
     p.db.selectFrom("refund_legs").selectAll().where("refund_id", "=", r.id).execute(),
     p.db
@@ -289,7 +289,7 @@ async function viewOf(p: Payments, r: RefundRow) {
       .where("id", "=", r.payment_intent_id)
       .executeTakeFirstOrThrow(),
   ]);
-  return refundView(r, legs, { id: intent.settlement_asset_id, decimals: intent.settlement_decimals }, p.now());
+  return refundView(r, legs, { id: intent.settlement_asset_id, decimals: intent.settlement_decimals }, p.now(), o);
 }
 
 async function viewsOf(p: Payments, rows: readonly RefundRow[]) {
@@ -338,10 +338,11 @@ export async function getRefund(p: Payments, m: Merchant, id: string) {
 }
 
 /** `GET /internal/refunds/{id}` (services) and `GET /ops/refunds/{id}` (console): no account predicate. */
-export async function getRefundById(p: Payments, id: string) {
+/** A refund by id (internal and ops views); `relaying`: agentpay's view of a leg it validates (refundView). */
+export async function getRefundById(p: Payments, id: string, o: { relaying?: boolean } = {}) {
   const r = await p.db.selectFrom("refunds").selectAll().where("id", "=", toUuid(id, "re")).executeTakeFirst();
   if (!r) throw ApiError.missing("refund", id);
-  return viewOf(p, r);
+  return viewOf(p, r, o);
 }
 
 export interface RefundListQuery extends PageQuery {

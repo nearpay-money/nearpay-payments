@@ -236,6 +236,21 @@ describe("stage 2 objects", () => {
     );
     expect(Refund.parse(w).next_action?.type).toBe("sign_intent");
     expect(w.legs).toHaveLength(1); // a leg being prepared is not shown
+    // a leg being relayed (`submitting`): hidden from merchants, still shown to agentpay's relay check
+    const relayed = { ...intents, status: "submitting" } as typeof intents;
+    const at = (o?: { relaying: boolean }) =>
+      refundView({ ...r, current_leg_id: intents.id }, [relayed], { id: USDC_NEAR, decimals: 6 }, Date.now(), o);
+    expect(at().next_action).toBeNull();
+    expect(at({ relaying: true }).next_action?.type).toBe("sign_intent");
+    expect(
+      refundView(
+        { ...r, status: "pending", current_leg_id: intents.id },
+        [relayed],
+        { id: USDC_NEAR, decimals: 6 },
+        Date.now(),
+        { relaying: true },
+      ).next_action,
+    ).toBeNull();
     // past the deadline / not requires_action: no next action
     expect(
       refundView(

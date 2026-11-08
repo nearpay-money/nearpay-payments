@@ -1237,7 +1237,11 @@ describe('spec 0.2.1 (lld/payments.md §"Spec 0.2.1 contract changes")', () => {
       await st.admin.db.deleteFrom("kill_switch").execute();
       st.killSwitchRead = null;
       expect(await syncKillSwitchAtBoot(st.payments)).toBe("unknown");
-      expect((await refund()).body.error.params).toMatchObject({ reason: "kill_switch_unknown" });
+      // (the envelope carries code + message only; `params` just render the catalogue message)
+      const unknown = await refund();
+      expect(unknown.status).toBe(503);
+      expect(unknown.body.error.code).toBe("rail_unavailable");
+      expect(unknown.body.error.message).toMatch(/state is known/);
       // boot read: released at version 5000
       st.killSwitchRead = { engaged: false, version: 5000, reason: "normal" };
       expect(await syncKillSwitchAtBoot(st.payments)).toBe("released");
@@ -1264,7 +1268,9 @@ describe('spec 0.2.1 (lld/payments.md §"Spec 0.2.1 contract changes")', () => {
       st.killSwitchRead = { engaged: true, reason: "no version" };
       expect(await syncKillSwitchAtBoot(st.payments)).toBe("engaged");
       expect((await killSwitchRow())?.version).toBe(0);
-      expect((await refund()).body.error.params).toMatchObject({ reason: "kill_switch_engaged" });
+      const engaged = await refund();
+      expect(engaged.status).toBe(503);
+      expect(engaged.body.error.message).toMatch(/kill switch is engaged/);
       await ev(false, 1, "released");
       await waitFor(async () => (await killSwitchRow())?.engaged === false);
       expect((await refund()).status).toBe(201);

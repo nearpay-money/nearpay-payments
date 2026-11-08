@@ -104,6 +104,16 @@ export async function paymentOptions(
   const { s, i } = await payerSession(p, sessionId, secret);
   if (s.status !== "open" || (i.status !== "requires_payment" && i.status !== "processing"))
     throw new ApiError("session_not_open");
+  return sessionOptions(p, s, i, q);
+}
+
+/** The session's payment options (rails, indicative; usable first). Empty when rails cannot answer. */
+export async function sessionOptions(
+  p: Payments,
+  s: SessionRow,
+  i: IntentRow,
+  q: { chain?: string | undefined; wallet?: string | undefined } = {},
+) {
   const d = i.destination_snapshot;
   const pricing: Pricing =
     i.currency === "asset"

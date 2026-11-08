@@ -45,3 +45,16 @@ export function originsProblem(
     return "http://localhost origins are allowed in test mode only";
   return null;
 }
+
+/** Invoice sessions (§20 item 1): `expires_at` at least 5 minutes and at most 30 days ahead. */
+export const INVOICE_SESSION_MIN_S = 300;
+export const INVOICE_SESSION_MAX_S = 30 * 86_400;
+
+/** Why an invoice session's `expires_at` is refused (`null` = accepted). */
+export function invoiceExpiryProblem(expiresAtMs: number, nowMs: number): string | null {
+  if (!Number.isFinite(expiresAtMs)) return "expires_at is not a valid timestamp";
+  const ahead = (expiresAtMs - nowMs) / 1000;
+  if (ahead < INVOICE_SESSION_MIN_S) return "expires_at must be at least 5 minutes ahead";
+  if (ahead > INVOICE_SESSION_MAX_S) return "expires_at must be at most 30 days ahead";
+  return null;
+}

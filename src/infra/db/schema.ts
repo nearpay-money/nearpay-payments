@@ -1,5 +1,6 @@
 /**
- * Kysely table types (migrations/0001_payments.sql, 0002_stage2.sql, 0003_audit_fixes.sql, 0004_spec_0_2_1.sql). numeric(78,0) columns read as decimal
+ * Kysely table types (migrations/0001_payments.sql, 0002_stage2.sql, 0003_audit_fixes.sql, 0004_spec_0_2_1.sql,
+ * 0005_stage3_invoices.sql). numeric(78,0) columns read as decimal
  * strings.
  */
 import type { ColumnType, KitTables } from "@nearpay-internal/db";
@@ -143,6 +144,8 @@ export interface CheckoutSessionsTable {
   customer_id: Opt<string>;
   payment_link_id: Opt<string>;
   headless: Def<boolean>;
+  /** Stage 3: the invoice the session pays (billing, §20); one `open` session per invoice. */
+  invoice_id: Opt<string>;
   created_at: Timestamp;
   updated_at: Timestamp;
   version: Def<number>;

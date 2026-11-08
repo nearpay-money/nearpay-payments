@@ -104,7 +104,7 @@ function payerError(code: string, message: string | undefined, param: string | u
 }
 
 /** A rails answer that settles the attempt as failed (an error envelope other than a transient one). */
-function definitive(e: unknown): { code: string; message?: string; param?: string } | null {
+export function definitive(e: unknown): { code: string; message?: string; param?: string } | null {
   const u = upstreamCode(e);
   if (!u.code || u.code === "api_error" || u.code === "idempotency_in_progress" || u.code === "rate_limited")
     return null;
@@ -259,7 +259,7 @@ export async function linkExecution(p: Payments, attemptId: string, x: Execution
   return a;
 }
 
-async function quote(p: Payments, sessionUuid: string, r: AttemptRequest): Promise<AttemptRow> {
+export async function quote(p: Payments, sessionUuid: string, r: AttemptRequest): Promise<AttemptRow> {
   const { attemptId, s, i } = await insertQuoting(p, sessionUuid, r);
   await p.notifier.publish(s.id);
   let x: Execution;
@@ -596,7 +596,7 @@ export async function advanceAttempt(
   await sandboxCall(() => sb.advance({ deposit_address: d.address, ...(d.memo ? { memo: d.memo } : {}), to }));
 }
 
-async function sandboxCall(fn: () => Promise<void>): Promise<void> {
+export async function sandboxCall(fn: () => Promise<void>): Promise<void> {
   try {
     await fn();
   } catch (e) {

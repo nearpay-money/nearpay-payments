@@ -13,9 +13,11 @@ import { enqueueJob, sql } from "@nearpay-internal/db";
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Execution } from "@nearpay-internal/spec";
+import { ownedByPayments } from "../domain/payment-attempt/attempt.js";
 import {
   dayBounds,
   type EvidenceItem,
+  evidenceCountProblem,
   isCompletedDay,
   reconcile,
   type StatementLine,
@@ -120,7 +122,17 @@ export async function runJob(p: Payments, payload: unknown, attempt: number): Pr
 
 // ============================================================================================ execution
 
-async function allEvidence(p: Payments, account: string, livemode: boolean, day: string): Promise<Execution[]> {
+/**
+ * Every settled execution of the day; `owner: "payments"` lists only payments' own (spec 0.3.0, §16.1: agentpay's
+ * cross-chain x402 executions are not on payments' statement). Without an owner: every owner's (count check).
+ */
+async function allEvidence(
+  p: Payments,
+  account: string,
+  livemode: boolean,
+  day: string,
+  owner?: "payments",
+): Promise<Execution[]> {
   const out: Execution[] = [];
   let after: string | undefined;
   for (;;) {
@@ -130,6 +142,7 @@ async function allEvidence(p: Payments, account: string, livemode: boolean, day:
       day,
       limit: 1000,
       states: "succeeded",
+      ...(owner ? { owner } : {}),
       ...(after ? { starting_after: after } : {}),
     } as never);
     out.push(...page.data);
@@ -276,15 +289,21 @@ export async function executeRun(
         status: "error",
         error: `rails evidence for ${day} is not complete (${summary.in_flight} in flight, ${summary.held_open} held)`,
       });
-    const [evidence, lines] = await Promise.all([
-      allEvidence(p, run.account_id, run.livemode, day),
+    const [listed, lines] = await Promise.all([
+      allEvidence(p, run.account_id, run.livemode, day, "payments"),
       statementOf(p, run.account_id, run.livemode, day),
     ]);
-    if (evidence.length !== summaryCount(summary))
-      return await finish(p, run, {
-        status: "error",
-        error: `rails evidence pages (${evidence.length}) disagree with its summary (${summaryCount(summary)})`,
-      });
+    // defence in depth: an execution rails labels with another owner is never reconciled as ours
+    const evidence = listed.filter((x) => ownedByPayments(x.owner));
+    const expected = summaryCount(summary);
+    let all: { total: number; owned: number } | undefined;
+    if (evidence.length !== expected || listed.length !== evidence.length) {
+      // the summary counts every owner's executions: count them to tell another owner's from a gap
+      const unfiltered = await allEvidence(p, run.account_id, run.livemode, day);
+      all = { total: unfiltered.length, owned: unfiltered.filter((x) => ownedByPayments(x.owner)).length };
+    }
+    const countProblem = evidenceCountProblem(evidence.length, expected, all);
+    if (countProblem) return await finish(p, run, { status: "error", error: countProblem });
     const out = reconcile(lines, evidence.map(evidenceItem));
     const totals = await withDecimals(p, run.livemode, out.totals);
     await finish(p, run, { status: out.diffs.length ? "diff" : "ok", totals, diffs: out.diffs });

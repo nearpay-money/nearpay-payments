@@ -57,12 +57,22 @@ export interface SessionCreate {
 
 export { assetInfo } from "./pricing.js";
 
-/** What opens a session: the merchant API, an API intent (headless), or a payment link payer. */
+/** What opens a session: the merchant API, an API intent (headless), a payment link payer, or billing (invoice). */
 export interface SessionSpec extends SessionCreate {
-  readonly source: "checkout" | "payment_link" | "api";
+  readonly source: "checkout" | "payment_link" | "api" | "invoice";
   readonly customerId?: string | null;
   readonly paymentLinkId?: string | null;
   readonly headless?: boolean;
+  /** Stage 3 (§20): the invoice (uuid) an invoice session pays; at most one `open` session per invoice. */
+  readonly invoiceId?: string | null;
+  /** An explicit deadline (invoice sessions: 5 min–30 d ahead, checked by the caller) instead of `expires_in`. */
+  readonly expiresAt?: Date;
+}
+
+/** Postgres unique violation on the one-open-session-per-invoice index (migration 0005). */
+function isOpenInvoiceConflict(e: unknown): boolean {
+  const pg = e as { code?: string; constraint?: string } | null;
+  return pg?.code === "23505" && pg.constraint === "cs_invoice_open";
 }
 
 export interface Opened {
@@ -161,106 +171,122 @@ export async function openSession(p: Payments, m: Merchant, body: SessionSpec): 
     fingerprint: dest.fingerprint ?? null,
   };
   const metadata = JSON.stringify(body.metadata ?? {});
-  const expiresAt = new Date(now + ttl * 1000);
+  const expiresAt = body.expiresAt ?? new Date(now + ttl * 1000);
 
-  const { s, i } = await p.db.transaction().execute(async (tx) => {
-    if (body.paymentLinkId) await reserveLinkUse(tx, m, body.paymentLinkId);
-    const i0 = await tx
-      .insertInto("payment_intents")
-      .values({
-        id: intentId,
-        account_id: m.account,
-        livemode: m.livemode,
-        status: "requires_payment",
-        amount: assetPriced ? null : Number(body.amount),
-        currency: body.currency,
-        pricing_asset_id: assetPriced ? (body.asset_id as string) : null,
-        pricing_asset_amount: assetPriced ? String(body.amount) : null,
-        description: body.description ?? null,
-        source: body.source,
-        customer_id: body.customerId ?? null,
-        payment_link_id: body.paymentLinkId ?? null,
-        destination_snapshot: JSON.stringify(snapshot),
-        fee_snapshot: JSON.stringify({ schedule: ctx.fee_schedule, bearer: ctx.account.fee_bearer }),
-        settings_snapshot: JSON.stringify({
-          late_payments: body.late_payments ?? settings.late_payments,
-          underpay_tolerance_bps: Math.min(settings.underpay_tolerance_bps, p.settings.underpayToleranceMaxBps),
-        }),
-        settlement_asset_id: dest.asset_id,
-        settlement_decimals: destAsset.decimals,
-        settlement_symbol: destAsset.symbol,
-        metadata,
-        version: 1,
-        sequence: 1,
-      })
-      .returningAll()
-      .executeTakeFirstOrThrow();
-    const s0 = await tx
-      .insertInto("checkout_sessions")
-      .values({
-        id: sessionId,
-        account_id: m.account,
-        livemode: m.livemode,
-        payment_intent_id: intentId,
-        status: "open",
-        client_secret_hash: secret.hash,
-        ui_mode: body.ui_mode,
-        success_url: body.success_url,
-        cancel_url: body.cancel_url ?? null,
-        expires_at: expiresAt,
-        customer_email_enc: body.customer_email
-          ? p.cipher.encrypt(body.customer_email.toLowerCase(), `cs:${sessionId}`)
-          : null,
-        locale: body.locale ?? null,
-        allowed_origins: [...origins],
-        metadata,
-        customer_id: body.customerId ?? null,
-        payment_link_id: body.paymentLinkId ?? null,
-        headless: body.headless ?? false,
-        version: 1,
-      })
-      .returningAll()
-      .executeTakeFirstOrThrow();
-    const actor = body.source === "payment_link" ? "payer" : "merchant";
-    await tx
-      .insertInto("payment_intent_transitions")
-      .values({
-        id: uuidv7(),
-        payment_intent_id: intentId,
-        from_state: null,
-        to_state: "requires_payment",
-        cause:
-          body.source === "api"
-            ? "payment intent created"
-            : body.source === "payment_link"
-              ? "payment link session opened"
-              : "checkout session created",
-        actor,
-        evidence: null,
-      })
-      .execute();
-    await tx
-      .insertInto("checkout_session_transitions")
-      .values({
-        id: uuidv7(),
-        checkout_session_id: sessionId,
-        from_state: null,
-        to_state: "open",
-        cause: body.headless ? "created (headless, API intent)" : "created",
-        actor,
-        evidence: null,
-      })
-      .execute();
-    await emitIntentEvents(tx, i0, ["evt.payments.payment_intent.created"]);
-    await enqueueJob(tx, {
-      kind: SESSION_EXPIRE_JOB,
-      payload: { session: sessionId },
-      runAt: expiresAt,
-      dedupeKey: `${SESSION_EXPIRE_JOB}:${sessionId}`,
-      maxAttempts: 50,
+  const run = () =>
+    p.db.transaction().execute(async (tx) => {
+      if (body.paymentLinkId) await reserveLinkUse(tx, m, body.paymentLinkId);
+      const i0 = await tx
+        .insertInto("payment_intents")
+        .values({
+          id: intentId,
+          account_id: m.account,
+          livemode: m.livemode,
+          status: "requires_payment",
+          amount: assetPriced ? null : Number(body.amount),
+          currency: body.currency,
+          pricing_asset_id: assetPriced ? (body.asset_id as string) : null,
+          pricing_asset_amount: assetPriced ? String(body.amount) : null,
+          description: body.description ?? null,
+          source: body.source,
+          customer_id: body.customerId ?? null,
+          payment_link_id: body.paymentLinkId ?? null,
+          invoice_id: body.invoiceId ?? null,
+          destination_snapshot: JSON.stringify(snapshot),
+          fee_snapshot: JSON.stringify({ schedule: ctx.fee_schedule, bearer: ctx.account.fee_bearer }),
+          settings_snapshot: JSON.stringify({
+            late_payments: body.late_payments ?? settings.late_payments,
+            underpay_tolerance_bps: Math.min(settings.underpay_tolerance_bps, p.settings.underpayToleranceMaxBps),
+          }),
+          settlement_asset_id: dest.asset_id,
+          settlement_decimals: destAsset.decimals,
+          settlement_symbol: destAsset.symbol,
+          metadata,
+          version: 1,
+          sequence: 1,
+        })
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      const s0 = await tx
+        .insertInto("checkout_sessions")
+        .values({
+          id: sessionId,
+          account_id: m.account,
+          livemode: m.livemode,
+          payment_intent_id: intentId,
+          status: "open",
+          client_secret_hash: secret.hash,
+          ui_mode: body.ui_mode,
+          success_url: body.success_url,
+          cancel_url: body.cancel_url ?? null,
+          expires_at: expiresAt,
+          customer_email_enc: body.customer_email
+            ? p.cipher.encrypt(body.customer_email.toLowerCase(), `cs:${sessionId}`)
+            : null,
+          locale: body.locale ?? null,
+          allowed_origins: [...origins],
+          metadata,
+          customer_id: body.customerId ?? null,
+          payment_link_id: body.paymentLinkId ?? null,
+          headless: body.headless ?? false,
+          invoice_id: body.invoiceId ?? null,
+          version: 1,
+        })
+        .returningAll()
+        .executeTakeFirstOrThrow();
+      const actor = body.source === "payment_link" ? "payer" : body.source === "invoice" ? "billing" : "merchant";
+      await tx
+        .insertInto("payment_intent_transitions")
+        .values({
+          id: uuidv7(),
+          payment_intent_id: intentId,
+          from_state: null,
+          to_state: "requires_payment",
+          cause:
+            body.source === "api"
+              ? "payment intent created"
+              : body.source === "payment_link"
+                ? "payment link session opened"
+                : body.source === "invoice"
+                  ? "invoice checkout session created"
+                  : "checkout session created",
+          actor,
+          evidence: null,
+        })
+        .execute();
+      await tx
+        .insertInto("checkout_session_transitions")
+        .values({
+          id: uuidv7(),
+          checkout_session_id: sessionId,
+          from_state: null,
+          to_state: "open",
+          cause: body.headless ? "created (headless, API intent)" : "created",
+          actor,
+          evidence: null,
+        })
+        .execute();
+      await emitIntentEvents(tx, i0, ["evt.payments.payment_intent.created"]);
+      await enqueueJob(tx, {
+        kind: SESSION_EXPIRE_JOB,
+        payload: { session: sessionId },
+        runAt: expiresAt,
+        dedupeKey: `${SESSION_EXPIRE_JOB}:${sessionId}`,
+        maxAttempts: 50,
+      });
+      return { s: s0, i: i0 };
     });
-    return { s: s0, i: i0 };
-  });
+  let created: Awaited<ReturnType<typeof run>>;
+  try {
+    created = await run();
+  } catch (e) {
+    if (isOpenInvoiceConflict(e))
+      throw new ApiError("state_conflict", {
+        message: "The invoice already has an open checkout session; continue that one or expire it first.",
+      });
+    throw e;
+  }
+  const { s, i } = created;
   return { s, i, secret: secret.secret, url: `${p.settings.payOrigin}/c/${csId}#${secret.secret}` };
 }
 
@@ -346,9 +372,25 @@ export async function listSessions(p: Payments, m: Merchant, q: SessionListQuery
 /** `POST /v1/checkout/sessions/{id}/expire` (domain-model §4.1: open → expired, nothing in flight). */
 export async function expireSession(p: Payments, m: Merchant, id: string) {
   const own = await ownSession(p, m, id);
+  return expireOpen(p, own, { cause: "expired by the merchant", actor: "merchant" });
+}
+
+/**
+ * Expires an open session with its intent (domain-model §4.1), shared by the merchant expire and billing's
+ * `expireInvoiceCheckoutSession`: `attempt_in_flight` while a deposit is in flight (nothing changes),
+ * `state_conflict` for any other status — unless `expiredIsDone`, where an `expired` session is returned as is.
+ * Emits `payment_intent.expired` and `checkout_session.expired` in the same transaction.
+ */
+export async function expireOpen(
+  p: Payments,
+  own: SessionRow,
+  meta: { cause: string; actor: string },
+  o: { expiredIsDone?: boolean } = {},
+) {
   const out = await p.db.transaction().execute(async (tx) => {
     let i = (await lockIntent(tx, own.payment_intent_id)) as IntentRow;
     let s = (await lockSessionOfIntent(tx, i.id)) as SessionRow;
+    if (o.expiredIsDone && s.status === "expired") return { s, i, changed: false };
     const attempts = await attemptsOf(tx, i.id, true);
     const err = canExpire(
       s.status,
@@ -360,16 +402,15 @@ export async function expireSession(p: Payments, m: Merchant, id: string) {
       throw new ApiError("state_conflict", {
         message: `The session is ${s.status}; only an open session can be expired.`,
       });
-    const meta = { cause: "expired by the merchant", actor: "merchant" };
     await hideAttempts(tx, i.id);
     s = await updateSession(tx, s, { status: "expired" }, meta);
     const previous = { status: i.status };
     i = await updateIntent(tx, i, { status: "expired" }, meta);
     i = await emitIntentEvents(tx, i, ["evt.payments.payment_intent.expired"], previous);
     await emitSessionEvents(tx, s, i, ["evt.payments.checkout_session.expired"]);
-    return { s, i, attempts: await attemptsOf(tx, i.id) };
+    return { s, i, changed: true };
   });
-  await p.notifier.publish(out.s.id);
+  if (out.changed) await p.notifier.publish(out.s.id);
   return sessionView(out.s, out.i);
 }
 

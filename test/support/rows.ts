@@ -123,6 +123,7 @@ export const sessionRow = (intent: IntentRow, o: Partial<SessionRow> = {}): Sess
   customer_id: null,
   payment_link_id: null,
   headless: false,
+  invoice_id: null,
   created_at: now,
   updated_at: now,
   version: 2,

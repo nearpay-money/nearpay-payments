@@ -110,6 +110,21 @@ node dist/main.js api|worker|migrate|healthcheck
   summary + pages; append-only runs on `/ops/reconciliation_runs…`; `diff`/`error` opens a compliance
   `reconciliation_diff` case; console writes publish `evt.payments.ops_action.recorded`.
 
+## Behaviour (Stage 3)
+
+- **Invoice sessions for billing** (`/internal/checkout_sessions…`, lld §20): billing opens the hosted session that
+  pays an invoice (`source: invoice`, `invoice`, customer, `expires_at` 5 min–30 d) with every session guard
+  (live account, active destination, rails minimum, unverified cap, currency); one `open` session per invoice
+  (unique index → `409`); `Idempotency-Key` honoured for billing's service token; secret and URL returned once.
+  `getInternalCheckoutSession` never returns the secret; `expireInvoiceCheckoutSession` acts like the merchant
+  expire. `invoice` is on every intent/session object and event; `listPaymentIntents?invoice=`;
+  `getInternalCustomer` (decrypted email, `deleted`). The hosted invoice payer routes are billing's.
+- **`nearpay trigger`**: `POST /v1/test_helpers/checkout_sessions/{id}/pay` (test mode) quotes a `route_quote`
+  attempt from the first sandbox option with the simulated payer's refund address, deposits and advances the
+  sandbox; outcomes arrive as normal rails events. The test helpers also accept the CLI's restricted test key.
+- **Executions of other owners** (`Execution.owner ≠ payments`, agentpay's x402) are acknowledged without effect;
+  reconciliation lists `listEvidence?owner=payments` and checks the count against rails' all-owner summary.
+
 ## Ops CLI (Stage 1)
 
 `docker compose -p nearpay exec payments-api /nodejs/bin/node dist/ops.js <command>`: `intent <pi_…>`, `session <cs_…>`, `attempt-recover <pa_…>`, `context-refresh <acct_…> [--live]`, `stuck`.
@@ -117,7 +132,9 @@ node dist/main.js api|worker|migrate|healthcheck
 ## Status
 
 Stage 1 implemented (step 1.2). Stage 2 implemented (step 2.2, spec 0.2.0, kit 0.2.0): every stage ≤ 2 route of the
-spec including the `/ops` console routes, the 16 consumed subjects, the 17 produced ones.
+spec including the `/ops` console routes, the 16 consumed subjects, the 17 produced ones. Stage 3 implemented (step
+3.2, spec 0.3.0, kit 0.2.1): internal invoice sessions and customer read, the checkout-session pay test helper,
+foreign-owner executions ignored, owner-filtered reconciliation (migration `0005_stage3_invoices.sql`).
 
 ## Built with
 

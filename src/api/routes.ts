@@ -30,6 +30,7 @@ import {
   listPaymentLinks,
   listPaymentOptions,
   listRefunds,
+  payCheckoutSessionTestHelper,
   prepareRefund,
   reviewPaymentIntent,
   signalDepositSent,
@@ -47,7 +48,11 @@ import { toUuid } from "@nearpay-internal/ids";
 import { ApiError, implement, type RequestContext, type RouteBinding, respond } from "@nearpay-internal/service";
 import {
   createAgentAttempt as createAgentAttemptRoute,
+  createInvoiceCheckoutSession,
   createOpsReconciliationRun,
+  expireInvoiceCheckoutSession,
+  getInternalCheckoutSession,
+  getInternalCustomer,
   getInternalPaymentIntent,
   getInternalRefund,
   getOpsReconciliationRun,
@@ -69,6 +74,7 @@ import {
   listIntents,
   reviewIntent,
 } from "../app/intents.js";
+import { createInvoiceSession, expireInvoiceSession, getInternalSession } from "../app/invoice-sessions.js";
 import { operatorOf } from "../app/ops-audit.js";
 import { getPayerSession, getPublicSession, paymentOptions } from "../app/payer.js";
 import * as links from "../app/payment-links.js";
@@ -77,6 +83,7 @@ import * as recon from "../app/reconciliation.js";
 import * as refunds from "../app/refunds.js";
 import { createSession, expireSession, getSession, listSessions, type Merchant } from "../app/sessions.js";
 import { listLines } from "../app/statement.js";
+import { payWithTestHelper } from "../app/test-helpers.js";
 import { clientIp } from "../domain/payment-link/rate-limit.js";
 import { openStream } from "../sse/stream.js";
 
@@ -254,5 +261,21 @@ export function paymentsRoutes(p: Payments): RouteBinding[] {
       async (ctx) => recon.resolveRun(p, operatorOf(ctx), ctx.params.id, ctx.body) as never,
     ),
     implement(getOpsRefund, async (ctx) => refunds.getRefundById(p, ctx.params.id) as never),
+
+    // ---- stage 3: internal invoice sessions for billing (§6.3, §20)
+    implement(createInvoiceCheckoutSession, async (ctx) =>
+      respond(201, (await createInvoiceSession(p, ctx.body as never, ctx.idempotencyKey)) as never),
+    ),
+    implement(getInternalCheckoutSession, async (ctx) => getInternalSession(p, ctx.params.id) as never),
+    implement(
+      expireInvoiceCheckoutSession,
+      async (ctx) => expireInvoiceSession(p, ctx.params.id, ctx.body.reason) as never,
+    ),
+    implement(getInternalCustomer, async (ctx) => customers.getInternalCustomer(p, ctx.params.id) as never),
+
+    // ---- stage 3: `nearpay trigger` (§16.1; test mode only — the kit refuses live principals)
+    implement(payCheckoutSessionTestHelper, async (ctx) =>
+      respond(202, (await payWithTestHelper(p, merchant(ctx), ctx.params.id, ctx.body as never)) as never),
+    ),
   ];
 }

@@ -3,6 +3,7 @@
 import type { KeyObject } from "node:crypto";
 import type { EnvelopeCipher, Kysely, Transaction } from "@nearpay-internal/db";
 import type { Logger, ServiceMetrics } from "@nearpay-internal/service";
+import type { ClientIpRule } from "../domain/client-ip.js";
 import type { Nonces } from "../infra/clients/near.js";
 import type {
   Agentpay,
@@ -104,6 +105,8 @@ export function newCaches(now: () => number = Date.now): Caches {
 
 export interface Payments {
   readonly env: string;
+  /** Where the client IP comes from (NP_CLIENT_IP_HEADER, NP_TRUSTED_PROXIES); default: by NP_ENV. */
+  readonly clientIp?: ClientIpRule;
   readonly db: Kysely<DB>;
   log: Logger;
   metrics: PaymentsMetrics;

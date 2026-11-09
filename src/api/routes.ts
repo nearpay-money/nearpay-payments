@@ -3,6 +3,7 @@
  * automatic idempotency (merchant POSTs with `Idempotency-Key`) are enforced from the spec by the
  * service bootstrap; payer routes authenticate with the session's client secret here.
  */
+
 import {
   advancePaymentAttempt,
   cancelPaymentIntent,
@@ -84,6 +85,7 @@ import * as refunds from "../app/refunds.js";
 import { createSession, expireSession, getSession, listSessions, type Merchant } from "../app/sessions.js";
 import { listLines } from "../app/statement.js";
 import { payWithTestHelper } from "../app/test-helpers.js";
+import { clientIpRule, fromTrustedProxy } from "../domain/client-ip.js";
 import { clientIp } from "../domain/payment-link/rate-limit.js";
 import { openStream } from "../sse/stream.js";
 
@@ -101,17 +103,25 @@ const header = (ctx: RequestContext, name: string): string | undefined => {
 
 /**
  * The payer's IP by identity's rule (L-ID-07, audit finding 3): `CF-Connecting-IP` on the server stage,
- * the first `X-Forwarded-For` hop elsewhere; `unknown` when absent or malformed. Cloudflare geo headers.
+ * the rightmost untrusted `X-Forwarded-For` hop elsewhere; `unknown` when absent or malformed. Cloudflare geo
+ * headers only through a trusted proxy.
  */
 export function payerClient(p: Payments, ctx: RequestContext) {
-  const ip = clientIp(p.env, {
-    cfConnectingIp: header(ctx, "cf-connecting-ip"),
-    xForwardedFor: header(ctx, "x-forwarded-for"),
-  });
+  const ip = clientIp(
+    p.env,
+    {
+      cfConnectingIp: header(ctx, "cf-connecting-ip"),
+      xForwardedFor: header(ctx, "x-forwarded-for"),
+      peer: ctx.request.socket?.remoteAddress,
+    },
+    p.clientIp,
+  );
+  // Cloudflare's geo headers count only when the request came through the gateway (a trusted proxy peer)
+  const fromEdge = fromTrustedProxy(p.clientIp ?? clientIpRule(p.env), ctx.request.socket?.remoteAddress);
   return {
     ip: ip ?? "unknown",
-    country: header(ctx, "cf-ipcountry") ?? null,
-    region: header(ctx, "cf-region-code") ?? null,
+    country: fromEdge ? (header(ctx, "cf-ipcountry") ?? null) : null,
+    region: fromEdge ? (header(ctx, "cf-region-code") ?? null) : null,
   };
 }
 

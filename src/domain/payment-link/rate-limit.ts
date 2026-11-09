@@ -2,22 +2,25 @@
  * Anonymous payment-link limits (lld/payments.md §6.2, audit finding 3). Pure.
  *
  * - Client IP: identity's rule (L-ID-07) — `CF-Connecting-IP` on the server stage (Cloudflare-only
- *   origin), the first `X-Forwarded-For` hop (set by Traefik) elsewhere; never either outside its stage.
+ *   origin), the rightmost untrusted `X-Forwarded-For` hop elsewhere; headers only from a trusted proxy peer.
  * - Clients are counted by network prefix (/24 IPv4, /64 IPv6): one host rotating addresses inside its
  *   allocation is one client.
  * - Windows are sliding, approximated from two fixed windows (the previous one weighted by how much of
  *   it still overlaps): O(1) state per key, the same arithmetic in Valkey and in the in-process fallback.
  */
 import { isIPv4, isIPv6 } from "node:net";
+import { type ClientIpRule, clientIpRule, resolveClientIp } from "../client-ip.js";
 
-/** Client IP (copied from identity `clientIp`, L-ID-07); null when absent or malformed. */
+/**
+ * Client IP (identity's rule, L-ID-07); null when absent or malformed. Forwarding headers count only from a
+ * trusted proxy peer (`NP_TRUSTED_PROXIES`); see domain/client-ip.ts.
+ */
 export function clientIp(
   env: string,
-  h: { cfConnectingIp?: string | undefined; xForwardedFor?: string | undefined },
+  h: { cfConnectingIp?: string | undefined; xForwardedFor?: string | undefined; peer?: string | undefined },
+  rule: ClientIpRule = clientIpRule(env),
 ): string | null {
-  const v = env === "server" ? h.cfConnectingIp : h.xForwardedFor?.split(",")[0];
-  const ip = v?.trim();
-  return ip && /^[0-9a-fA-F:.]{2,45}$/.test(ip) ? ip : null;
+  return resolveClientIp(rule, h);
 }
 
 /** The client's network: `a.b.c.0/24` (IPv4, IPv4-mapped IPv6 included) or the first 64 bits (IPv6). */

@@ -4,6 +4,7 @@
  * - `worker`  consumers (rails, identity, compliance), jobs (session expiry, quoting recovery,
  *             context refresh, purge) and the outbox relay
  */
+
 import { createHmac, createPrivateKey, type KeyObject } from "node:crypto";
 import { hostname } from "node:os";
 import type { KeySource } from "@nearpay-internal/auth";
@@ -39,6 +40,7 @@ import { STREAMS, type Subject } from "@nearpay-internal/spec";
 import { paymentsRoutes } from "../api/routes.js";
 import type { ApiConfig, SharedConfig, WorkerConfig } from "../config.js";
 import { deadLetters, paymentsHandlers } from "../consumers/handlers.js";
+import { clientIpRule } from "../domain/client-ip.js";
 import { type Nonces, verifierNonces } from "../infra/clients/near.js";
 import {
   type Agentpay,
@@ -106,6 +108,7 @@ function build(config: SharedConfig, deps: ServiceDeps, app: string): Built {
   const peer = { serviceToken, ...f };
   const payments: Payments = {
     env: config.env,
+    clientIp: clientIpRule(config.env, { header: config.clientIpHeader, trustedProxies: config.trustedProxies }),
     db: database.db,
     log: undefined as unknown as Payments["log"],
     metrics: noMetrics,

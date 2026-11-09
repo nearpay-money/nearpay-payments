@@ -4,6 +4,7 @@
  */
 import { baseConfigShape, list, loadConfig, secret, url } from "@nearpay-internal/service";
 import { z } from "zod";
+import { CLIENT_IP_HEADERS, clientIpRule } from "./domain/client-ip.js";
 
 const http = () => url(["http:", "https:"]);
 const bounded = (min: number, max: number, fallback: number) =>
@@ -32,6 +33,10 @@ const shared = {
   ticketSigningKey: secret(),
   /** 32-byte KEK (base64 or hex) for PII envelope encryption (customer email). */
   piiKek: secret(),
+  /** Client IP source behind the gateway (default: cf-connecting-ip on the server stage, x-forwarded-for locally). */
+  clientIpHeader: z.enum(CLIENT_IP_HEADERS).optional(),
+  /** CIDRs of the proxies in front of payments whose forwarding headers count (default: loopback + private ranges). */
+  trustedProxies: list(z.string().min(1)).optional(),
   /** Cloudflare Turnstile secret; unset (local/test only) disables the challenge. */
   turnstileSecret: secret().optional(),
   turnstileBaseUrl: url(["https:", "http:"]).optional(),
@@ -62,6 +67,30 @@ export type SharedConfig = z.output<z.ZodObject<typeof shared>>;
 export type ApiConfig = z.output<z.ZodObject<typeof apiShape>>;
 export type WorkerConfig = z.output<z.ZodObject<typeof workerShape>>;
 
-export const readApiConfig = (): ApiConfig => loadConfig(apiShape);
-export const readWorkerConfig = (): WorkerConfig => loadConfig(workerShape);
+/** Cloudflare's documented Turnstile test secrets (always pass / fail / spent): local and test stacks only. */
+export const isTurnstileTestSecret = (s: string) => /^[123]x0+AA$/.test(s.trim());
+
+/**
+ * Server-stage rules (every NP_ENV but local/test): a real Turnstile secret is required (unset disables the
+ * challenge; a test secret passes every token, even through siteverify), checkout URLs use a public https
+ * origin, and the client-IP proxy list parses.
+ */
+export function checkServerConfig<
+  C extends Pick<SharedConfig, "env" | "turnstileSecret" | "payOrigin" | "clientIpHeader" | "trustedProxies">,
+>(c: C): C {
+  clientIpRule(c.env, { header: c.clientIpHeader, trustedProxies: c.trustedProxies });
+  if (c.env === "local" || c.env === "test") return c;
+  if (!c.turnstileSecret) throw new Error("NP_TURNSTILE_SECRET_FILE is required on the server stage");
+  if (isTurnstileTestSecret(c.turnstileSecret))
+    throw new Error(
+      "NP_TURNSTILE_SECRET_FILE holds a Cloudflare test secret: allowed only when NP_ENV is local or test",
+    );
+  const u = new URL(c.payOrigin);
+  if (u.protocol !== "https:" || u.hostname === "localhost" || u.hostname.endsWith(".localhost"))
+    throw new Error(`NP_PAY_ORIGIN must be a public https origin on the server stage (got ${c.payOrigin})`);
+  return c;
+}
+
+export const readApiConfig = (): ApiConfig => checkServerConfig(loadConfig(apiShape));
+export const readWorkerConfig = (): WorkerConfig => checkServerConfig(loadConfig(workerShape));
 export const readOpsConfig = (): SharedConfig => loadConfig(opsShape);

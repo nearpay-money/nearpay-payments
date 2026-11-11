@@ -64,16 +64,31 @@ export async function getPayerSession(p: Payments, sessionId: string, secret: st
 const REASONS = new Set(["route_too_slow", "amount_too_low", "route_unavailable", "pricing_unavailable"]);
 type Reason = "route_too_slow" | "amount_too_low" | "route_unavailable" | "pricing_unavailable";
 
+/**
+ * Rails' routing-health codes about prices (rails `domain/routing/health.ts`): the settlement asset has no reliable
+ * price. The payer sees `pricing_unavailable`; every other code (kill switch, treasury, cross-chain pause…) stays
+ * `route_unavailable`. Rails before the codes sent a sentence ("no reliable price for the settlement asset").
+ */
+const PRICE_CODES = new Set([
+  "settlement_price_stale",
+  "settlement_price_missing",
+  "settlement_price_depeg",
+  "settlement_price_disagree",
+  "fx_unavailable",
+]);
+
+/** Rails' (free-text) option reason as the public enum (spec `PaymentOption.reason`, unchanged). */
+export function payerReason(raw: string | null | undefined): Reason {
+  if (raw && REASONS.has(raw)) return raw as Reason;
+  if (raw && (PRICE_CODES.has(raw) || raw.startsWith("settlement_price_") || raw.startsWith("no reliable price")))
+    return "pricing_unavailable";
+  return "route_unavailable";
+}
+
 /** Rails' option as the payer sees it; the session window decides `route_too_slow`. */
 export function payerOption(o: InternalOption, remainingS: number, latePayments: boolean) {
   const tooSlow = !latePayments && remainingS < o.min_deadline_s;
-  const reason: Reason | null = tooSlow
-    ? "route_too_slow"
-    : o.available
-      ? null
-      : REASONS.has(o.reason ?? "")
-        ? (o.reason as Reason)
-        : "route_unavailable";
+  const reason: Reason | null = tooSlow ? "route_too_slow" : o.available ? null : payerReason(o.reason);
   return {
     method: o.method,
     origin_asset_id: o.origin_asset_id,
@@ -135,7 +150,10 @@ export async function sessionOptions(
     } catch {
       amountOut = null;
     }
-  if (amountOut === null || amountOut <= 0n) return { object: "payment_options" as const, options: [] };
+  if (amountOut === null || amountOut <= 0n) {
+    warnNoRoute(p, s, i, { cause: "settlement_estimate_unavailable", rails_reasons: [] });
+    return { object: "payment_options" as const, options: [] };
+  }
   let options: InternalOption[];
   try {
     options = await p.rails.options({
@@ -153,9 +171,44 @@ export async function sessionOptions(
   const remainingS = (s.expires_at.getTime() - p.now()) / 1000;
   const late = i.settings_snapshot.late_payments;
   const mapped = options.map((o) => payerOption(o, remainingS, late));
+  if (options.every((o) => !o.available))
+    warnNoRoute(p, s, i, {
+      cause: options.length ? "every_option_unavailable" : "no_options",
+      rails_reasons: [...new Set(options.map((o) => o.reason ?? "none"))],
+      payer_reasons: [...new Set(mapped.map((o) => o.reason ?? "none"))],
+      options: options.length,
+    });
   // usable options first, rails' ranking kept within each group
   return {
     object: "payment_options" as const,
     options: [...mapped.filter((o) => o.available), ...mapped.filter((o) => !o.available)],
   };
+}
+
+/** Sessions already reported by {@link warnNoRoute}, per process (bounded: cleared past the cap). */
+const reported = new WeakMap<object, Set<string>>();
+const REPORTED_CAP = 10_000;
+
+/**
+ * The payer sees "Payments are temporarily unavailable": logs it once per session (WARN) with rails' own reason
+ * codes, so the cause is visible (rails also exports `nearpay_rails_routing_blocked{reason}`).
+ */
+function warnNoRoute(p: Payments, s: SessionRow, i: IntentRow, detail: Record<string, unknown>): void {
+  let seen = reported.get(p);
+  if (!seen) {
+    seen = new Set();
+    reported.set(p, seen);
+  }
+  if (seen.has(s.id)) return;
+  if (seen.size >= REPORTED_CAP) seen.clear();
+  seen.add(s.id);
+  p.log.warn(
+    {
+      session: fromUuid("cs", s.id),
+      livemode: i.livemode,
+      destination_asset: i.destination_snapshot.asset_id,
+      ...detail,
+    },
+    "no payment option available for a checkout session: the payer sees 'Payments are temporarily unavailable'",
+  );
 }

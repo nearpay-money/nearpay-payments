@@ -5,7 +5,7 @@
  * attempts; quoting recovery; identity events mark contexts stale.
  */
 
-import { createExecution } from "@nearpay-internal/spec";
+import { createExecution, listInternalOptions } from "@nearpay-internal/spec";
 import { account, domainEvent, expectEvent } from "@nearpay-internal/testing";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { type Stack, startStack, USDC_BASE, USDC_NEAR, uuid } from "../support/stack.js";
@@ -451,5 +451,58 @@ describe("payer stream (SSE)", () => {
     });
     await until("event: attempt");
     ac.abort();
+  });
+});
+
+describe("payment options when nothing can route", () => {
+  it("maps rails' routing codes to the payer enum and warns once per session with rails' codes", async () => {
+    const option = (o: { method: "route_quote" | "intents_transfer"; reason: string }) => ({
+      method: o.method,
+      origin_asset_id: o.method === "route_quote" ? USDC_BASE : USDC_NEAR,
+      chain: o.method === "route_quote" ? "eip155:8453" : "near:mainnet",
+      symbol: "USDC",
+      decimals: 6,
+      estimated_amount_in: "2010000",
+      route_class: o.method === "route_quote" ? ("stable_pair" as const) : ("intents_transfer" as const),
+      applied_fee_bps: 50,
+      min_deadline_s: 120,
+      available: false,
+      reason: o.reason,
+    });
+    st.rails.on(listInternalOptions, async () => ({
+      options: [
+        option({ method: "intents_transfer", reason: "settlement_price_stale" }),
+        option({ method: "route_quote", reason: "kill_switch_engaged" }),
+      ],
+    }));
+    const lines: { fields: Record<string, unknown>; msg: string }[] = [];
+    const real = st.payments.log;
+    st.payments.log = {
+      ...real,
+      warn: (fields: Record<string, unknown>, msg: string) => {
+        lines.push({ fields, msg });
+      },
+    } as unknown as typeof real;
+    try {
+      const { r } = await session();
+      const cs = r.body.id as string;
+      const secret = r.body.client_secret as string;
+      const opts = await st.call("GET", `/v1/checkout/sessions/${cs}/public/payment_options`, { secret });
+      expect(opts.status).toBe(200);
+      expect(
+        opts.body.options.map((o: { available: boolean; reason: string }) => `${o.available}:${o.reason}`),
+      ).toEqual(["false:pricing_unavailable", "false:route_unavailable"]);
+      await st.call("GET", `/v1/checkout/sessions/${cs}/public/payment_options`, { secret });
+      const warned = lines.filter((l) => l.msg.startsWith("no payment option available"));
+      expect(warned).toHaveLength(1);
+      expect(warned[0]?.fields).toMatchObject({
+        session: cs,
+        cause: "every_option_unavailable",
+        rails_reasons: ["settlement_price_stale", "kill_switch_engaged"],
+        payer_reasons: ["pricing_unavailable", "route_unavailable"],
+      });
+    } finally {
+      st.payments.log = real;
+    }
   });
 });

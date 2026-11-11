@@ -3,7 +3,7 @@ import { generateKeyPairSync, verify } from "node:crypto";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { routeQuoteDepositKey } from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
-import { payerOption } from "../../src/app/payer.js";
+import { payerOption, payerReason } from "../../src/app/payer.js";
 import { depositKey, hashSecret, newClientSecret, secretMatches, signTicket } from "../../src/app/secrets.js";
 import { apiShape, workerShape } from "../../src/config.js";
 
@@ -79,6 +79,28 @@ describe("payment options", () => {
     );
     expect(payerOption({ ...o, available: false, reason: "something" }, 3600, false).reason).toBe("route_unavailable");
     expect(payerOption({ ...o, available: false, reason: null }, 3600, false).reason).toBe("route_unavailable");
+  });
+  it("maps rails' routing-health codes: price codes → pricing_unavailable, everything else → route_unavailable", () => {
+    const reason = (r: string | null) => payerOption({ ...o, available: false, reason: r }, 3600, false).reason;
+    for (const r of [
+      "settlement_price_stale",
+      "settlement_price_missing",
+      "settlement_price_depeg",
+      "settlement_price_disagree",
+      "fx_unavailable",
+      "no reliable price for the settlement asset", // rails before the codes
+    ])
+      expect(reason(r)).toBe("pricing_unavailable");
+    for (const r of [
+      "kill_switch_engaged",
+      "kill_switch_unknown",
+      "treasury_unset",
+      "cross_chain_paused",
+      "payments are paused",
+    ])
+      expect(reason(r)).toBe("route_unavailable");
+    expect(payerReason("pricing_unavailable")).toBe("pricing_unavailable");
+    expect(payerReason(undefined)).toBe("route_unavailable");
   });
 });
 

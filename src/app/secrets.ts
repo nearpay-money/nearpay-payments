@@ -8,7 +8,7 @@
  *   it only rate-gates sentinel; sentinel's verdict never depends on it.
  */
 import { createHash, type KeyObject, randomInt, sign, timingSafeEqual } from "node:crypto";
-import { routeQuoteDepositKey } from "@nearpay/spec";
+import { routeQuoteDepositKey } from "@nearpay-money/spec";
 import canonicalize from "canonicalize";
 
 const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";

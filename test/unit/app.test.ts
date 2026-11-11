@@ -1,7 +1,7 @@
 /** Client secrets, attestation tickets, payer option mapping and configuration. */
 import { generateKeyPairSync, verify } from "node:crypto";
-import { routeQuoteDepositKey } from "@nearpay/spec";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
+import { routeQuoteDepositKey } from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
 import { payerOption } from "../../src/app/payer.js";
 import { depositKey, hashSecret, newClientSecret, secretMatches, signTicket } from "../../src/app/secrets.js";

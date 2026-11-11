@@ -7,10 +7,11 @@
  * `attempt:<pa_id>`, so a crash between the two never loses a live quote: the quoting-recovery job
  * re-asks rails with the same key.
  */
-import type { ErrorCode, PayerAttempt } from "@nearpay/spec";
+
 import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
 import type { Execution } from "@nearpay-internal/spec";
+import type { ErrorCode, PayerAttempt } from "@nearpay-money/spec";
 import type { z } from "zod";
 import { attemptGuard } from "../domain/checkout-session/session.js";
 import { INSTRUCTIONS_LIVE, isAttemptStatus } from "../domain/payment-attempt/attempt.js";

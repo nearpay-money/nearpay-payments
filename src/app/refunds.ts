@@ -13,7 +13,7 @@
  * Lock order everywhere: intent → attempt → refund → legs (payment application takes the intent first
  * too, so the two never deadlock).
  */
-import type { MultiPayload } from "@nearpay/spec";
+
 import { getChain, validateAddress } from "@nearpay-internal/chains";
 import type { Updateable } from "@nearpay-internal/db";
 import { emit, enqueueJob } from "@nearpay-internal/db";
@@ -21,6 +21,7 @@ import { fromUuid, toUuid, uuidv7 } from "@nearpay-internal/ids";
 import { verifySigned } from "@nearpay-internal/intents";
 import { ApiError, type ApiErrorOptions } from "@nearpay-internal/service";
 import type { Execution } from "@nearpay-internal/spec";
+import type { MultiPayload } from "@nearpay-money/spec";
 import {
   matchesIssued,
   type SignIntentAction,

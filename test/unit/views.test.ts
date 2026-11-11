@@ -1,6 +1,7 @@
 /** Spec 0.1.5 view fields: the public session's `payment_intent` and the checkout session's `sequence`. */
-import { CheckoutSession, PublicCheckoutSession } from "@nearpay/spec";
+
 import { fromUuid } from "@nearpay-internal/ids";
+import { CheckoutSession, PublicCheckoutSession } from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
 import { publicSession, sessionView } from "../../src/app/views.js";
 import { intentRow, sessionRow } from "../support/rows.js";

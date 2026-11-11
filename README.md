@@ -59,7 +59,7 @@ nearpay-payments/
 ## Commands
 
 ```sh
-pnpm install                 # @nearpay/* from the local registry (nearpay-deploy/scripts/up.sh starts it)
+pnpm install                 # @nearpay-money/* from the local registry (nearpay-deploy/scripts/up.sh starts it)
 pnpm verify                  # typecheck, lint, unit + property tests (coverage gate), integration, build
 pnpm test                    # unit + property only (no Docker)
 pnpm test:integration        # Testcontainers (Postgres, NATS, Valkey) + spec contract tests

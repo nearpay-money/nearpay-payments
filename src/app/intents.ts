@@ -2,10 +2,11 @@
  * Payment intents for merchants (lld/payments.md §6.1, §5): read, list and cancel, and the internal
  * read for billing/agentpay/ops. Intents carry their attempts (newest first) and overpayments.
  */
-import { metadataFilters } from "@nearpay/spec";
+
 import { sql } from "@nearpay-internal/db";
 import { fromUuid, toUuid } from "@nearpay-internal/ids";
 import { ApiError } from "@nearpay-internal/service";
+import { metadataFilters } from "@nearpay-money/spec";
 import { isAttemptStatus } from "../domain/payment-attempt/attempt.js";
 import { amountFilters, fiatPredicate, SQL_OP } from "../domain/payment-intent/filters.js";
 import { canCancel, type IntentStatus, type SessionStatus } from "../domain/payment-intent/intent.js";

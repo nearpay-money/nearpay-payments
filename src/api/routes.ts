@@ -4,6 +4,25 @@
  * service bootstrap; payer routes authenticate with the session's client secret here.
  */
 
+import { toUuid } from "@nearpay-internal/ids";
+import { ApiError, implement, type RequestContext, type RouteBinding, respond } from "@nearpay-internal/service";
+import {
+  createAgentAttempt as createAgentAttemptRoute,
+  createInvoiceCheckoutSession,
+  createOpsReconciliationRun,
+  expireInvoiceCheckoutSession,
+  getInternalCheckoutSession,
+  getInternalCustomer,
+  getInternalPaymentIntent,
+  getInternalRefund,
+  getOpsReconciliationRun,
+  getOpsRefund,
+  getPayerCheckoutSession,
+  getReceiptContext,
+  getRefundReceiptContext,
+  listOpsReconciliationRuns,
+  resolveOpsReconciliationRun,
+} from "@nearpay-internal/spec";
 import {
   advancePaymentAttempt,
   cancelPaymentIntent,
@@ -44,26 +63,7 @@ import {
   updateCustomer,
   updatePaymentLink,
   updateRefundRecipient,
-} from "@nearpay/spec";
-import { toUuid } from "@nearpay-internal/ids";
-import { ApiError, implement, type RequestContext, type RouteBinding, respond } from "@nearpay-internal/service";
-import {
-  createAgentAttempt as createAgentAttemptRoute,
-  createInvoiceCheckoutSession,
-  createOpsReconciliationRun,
-  expireInvoiceCheckoutSession,
-  getInternalCheckoutSession,
-  getInternalCustomer,
-  getInternalPaymentIntent,
-  getInternalRefund,
-  getOpsReconciliationRun,
-  getOpsRefund,
-  getPayerCheckoutSession,
-  getReceiptContext,
-  getRefundReceiptContext,
-  listOpsReconciliationRuns,
-  resolveOpsReconciliationRun,
-} from "@nearpay-internal/spec";
+} from "@nearpay-money/spec";
 import * as attempts from "../app/attempts.js";
 import type { Payments } from "../app/context.js";
 import * as customers from "../app/customers.js";

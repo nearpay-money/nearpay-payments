@@ -19,7 +19,6 @@
  * | sentinel `GET /internal/kill-switch` | 2 s | 1      | no      |
  */
 
-import type { RouteBody, RouteQuery, RouteResponse } from "@nearpay/spec";
 import { HttpError, httpClient, TimeoutError } from "@nearpay-internal/http";
 import {
   abandonExecution,
@@ -47,6 +46,7 @@ import {
   signalExecution,
   submitExecutionDepositTx,
 } from "@nearpay-internal/spec";
+import type { RouteBody, RouteQuery, RouteResponse } from "@nearpay-money/spec";
 
 const BREAKER = { failureRate: 0.5, minCalls: 10, windowMs: 30_000, halfOpenAfterMs: 15_000 } as const;
 

@@ -8,9 +8,10 @@
  *   the exact NEP-413 `signMessage` arguments, the exact ERC-191 / raw-ed25519 string and the parsed
  *   message. `submit_tx` accepts only that payload (same standard family, nonce and bytes).
  */
-import type { MultiPayload, RefundNextAction } from "@nearpay/spec";
+
 import { buildPayload, nep413Message } from "@nearpay-internal/intents";
 import { formatUnits } from "@nearpay-internal/money";
+import type { MultiPayload, RefundNextAction } from "@nearpay-money/spec";
 
 export type SignIntentAction = Extract<RefundNextAction, { type: "sign_intent" }>;
 export type SignAndSendAction = Extract<RefundNextAction, { type: "sign_and_send" }>;

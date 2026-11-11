@@ -5,8 +5,9 @@
  * periodic re-check, so a lost notification only delays an update. Heartbeats and `retry:` come from
  * the route's stream definition.
  */
-import type { streamCheckoutSession } from "@nearpay/spec";
+
 import type { RequestContext } from "@nearpay-internal/service";
+import type { streamCheckoutSession } from "@nearpay-money/spec";
 import { payerSession } from "../app/attempts.js";
 import type { Payments } from "../app/context.js";
 import { publicSnapshot } from "../app/payer.js";

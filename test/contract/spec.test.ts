@@ -5,20 +5,6 @@
  */
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
-import {
-  BalanceTransaction,
-  CheckoutSession,
-  CreatedPaymentIntent,
-  Customer,
-  PayerAttempt,
-  PaymentIntent,
-  PaymentLink,
-  PUBLIC_ROUTES,
-  PublicCheckoutSession,
-  Refund,
-  streamCheckoutSession,
-  TestHelperPayment,
-} from "@nearpay/spec";
 import { unhandledSubjects } from "@nearpay-internal/bus";
 import { fromUuid, uuidv7 } from "@nearpay-internal/ids";
 import { unimplementedRoutes } from "@nearpay-internal/service";
@@ -32,6 +18,20 @@ import {
   type Subject,
 } from "@nearpay-internal/spec";
 import { USDC_NEAR } from "@nearpay-internal/testing";
+import {
+  BalanceTransaction,
+  CheckoutSession,
+  CreatedPaymentIntent,
+  Customer,
+  PayerAttempt,
+  PaymentIntent,
+  PaymentLink,
+  PUBLIC_ROUTES,
+  PublicCheckoutSession,
+  Refund,
+  streamCheckoutSession,
+  TestHelperPayment,
+} from "@nearpay-money/spec";
 import { describe, expect, it } from "vitest";
 import { paymentsRoutes } from "../../src/api/routes.js";
 import {

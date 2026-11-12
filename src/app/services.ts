@@ -275,6 +275,9 @@ export async function createWorker(
       handlers: jobHandlers(p),
       onError: (e, job) => service.log.warn({ err: e instanceof Error ? e.message : String(e), job }, "job failed"),
       onDeadLetter: (j) => service.log.error({ job: j }, "ALERT job dead-lettered"),
+      // kit 0.6.0 liveness: reconcile.run extends its lease to 300 s once and may legitimately run that long, so the
+      // worker's budget is above it (the kit default, max(3 x 60 s lease, 120 s) = 180 s, would fail /healthz mid-run)
+      maxSilenceMs: 360_000,
       ...(deps.tickMs ? { pollMs: deps.tickMs } : {}),
     }),
   );

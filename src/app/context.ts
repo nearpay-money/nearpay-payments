@@ -31,6 +31,17 @@ export interface PaymentsMetrics {
   timeToSuccess(routeClass: string, seconds: number): void;
   refund(outcome: string): void;
   reconciliation(status: string, diffs: number): void;
+  /**
+   * Kill-switch copy (app/kill-switch.ts, lld/payments.md §7 periodic read): `kill_switch_engaged` (1 = live refund
+   * legs paused by the copy: engaged or unknown), `kill_switch_version` (-1 = unknown).
+   */
+  killSwitchCopy(c: { engaged: boolean; version: number | null }): void;
+  /**
+   * Sentinel's answer at the last successful read: `kill_switch_source_engaged`, `kill_switch_source_version` (-1 =
+   * sentinel sent none), `kill_switch_last_read_timestamp_seconds`, `kill_switch_diverged` (1 when the copy still
+   * differs after the read was applied — deploy alert `KillSwitchCopyDiverged`).
+   */
+  killSwitchSource(s: { engaged: boolean; version: number | null; readAtMs: number; diverged: boolean }): void;
 }
 
 export const noMetrics: PaymentsMetrics = {
@@ -40,6 +51,8 @@ export const noMetrics: PaymentsMetrics = {
   timeToSuccess() {},
   refund() {},
   reconciliation() {},
+  killSwitchCopy() {},
+  killSwitchSource() {},
 };
 
 export function paymentsMetrics(m: ServiceMetrics): PaymentsMetrics {
@@ -61,7 +74,50 @@ export function paymentsMetrics(m: ServiceMetrics): PaymentsMetrics {
   ]);
   const runs = m.counter("reconciliation_runs_total", "Reconciliation runs by final status.", ["status"]);
   const diffs = m.counter("reconciliation_diffs_total", "Reconciliation differences found (target: zero).", []);
+  // registered on first use: only the processes that keep the copy (api, worker) export them
+  let ks: Record<
+    "engaged" | "version" | "srcEngaged" | "srcVersion" | "diverged" | "readAt",
+    ReturnType<typeof m.gauge>
+  > | null = null;
+  const ksGauges = () => {
+    ks ??= {
+      engaged: m.gauge(
+        "kill_switch_engaged",
+        "1 while payments' copy of sentinel's kill switch pauses live refund legs (engaged, or state unknown).",
+      ),
+      version: m.gauge("kill_switch_version", "Sentinel kill-switch version payments' copy came from (-1 = unknown)."),
+      srcEngaged: m.gauge(
+        "kill_switch_source_engaged",
+        "Sentinel's kill switch at payments' last successful read (1 = engaged).",
+      ),
+      srcVersion: m.gauge(
+        "kill_switch_source_version",
+        "Sentinel's kill-switch version at payments' last successful read (-1 = sentinel sent none).",
+      ),
+      diverged: m.gauge(
+        "kill_switch_diverged",
+        "1 when payments' kill-switch copy still differs from sentinel after the last read was applied (alert).",
+      ),
+      readAt: m.gauge(
+        "kill_switch_last_read_timestamp_seconds",
+        "Unix time of payments' last successful read of sentinel's kill switch.",
+      ),
+    };
+    return ks;
+  };
   return {
+    killSwitchCopy: (c) => {
+      const g = ksGauges();
+      g.engaged.set(c.engaged ? 1 : 0);
+      g.version.set(c.version ?? -1);
+    },
+    killSwitchSource: (x) => {
+      const g = ksGauges();
+      g.srcEngaged.set(x.engaged ? 1 : 0);
+      g.srcVersion.set(x.version ?? -1);
+      g.diverged.set(x.diverged ? 1 : 0);
+      g.readAt.set(Math.floor(x.readAtMs / 1000));
+    },
     refund: (outcome) => refunds.inc({ outcome }),
     reconciliation: (status, n) => {
       runs.inc({ status });

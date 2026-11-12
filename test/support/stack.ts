@@ -83,7 +83,7 @@ export interface Stack {
   readonly sandbox: MockPeer;
   readonly sentinel: MockPeer;
   /** What sentinel `getKillSwitch` answers (null: sentinel unavailable → 500). */
-  killSwitchRead: { engaged: boolean; version?: number; reason: string } | null;
+  killSwitchRead: { engaged: boolean; version?: number; reason: string; updated_at?: string } | null;
   /** `abandonExecution` calls rails received (execution id, reason), in order. */
   readonly abandoned: { id: string; reason: string }[];
   /** Nonce rails 0.2.1 puts into refund transfers (null: rails 0.2.0, no nonce). */
@@ -575,11 +575,13 @@ export async function startStack(o: StackOptions = {}): Promise<Stack> {
     block_height: 1,
   }));
 
-  const killSwitch: { read: { engaged: boolean; version?: number; reason: string } | null } = { read: null };
+  const killSwitch: { read: { engaged: boolean; version?: number; reason: string; updated_at?: string } | null } = {
+    read: null,
+  };
   const sentinel = await mockPeer({ service: "sentinel", routes: INTERNAL_ROUTES });
   sentinel.on(getKillSwitch, async () => {
     if (!killSwitch.read) throw new Error("sentinel is down");
-    return { ...killSwitch.read, actor: "ops", updated_at: new Date().toISOString() } as never;
+    return { actor: "ops", updated_at: new Date().toISOString(), ...killSwitch.read } as never;
   });
 
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");

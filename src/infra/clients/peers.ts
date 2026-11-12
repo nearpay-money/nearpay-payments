@@ -4,18 +4,18 @@
  *
  * | Target                       | Timeout | Retries | Breaker |
  * |------------------------------|---------|---------|---------|
- * | rails `POST /internal/executions` | 8 s | 0 (the quoting-recovery job retries) | global |
+ * | rails `POST /internal/executions` | 8 s | 0 (the quoting-recovery job retries) | no (PAYMENTS-2 interim) |
  * | rails reads (options, minimums, profiles, assets) | 2 s | 1 | yes |
  * | rails deposit tx / signals   | 2 s     | 1 (idempotent) | yes |
  * | identity settlement context  | 1 s     | 1       | yes     |
  * | agentpay `POST /internal/relay` | 8 s  | 1 (idempotent) | yes |
  * | compliance geo policy        | 1 s     | 1       | yes     |
  * | sandbox (test mode)          | 2 s     | 1       | no      |
- * | rails `POST /internal/refund_executions` | 8 s | 0 (the refund prepare-recovery job retries) | global |
+ * | rails `POST /internal/refund_executions` | 8 s | 0 (the refund prepare-recovery job retries) | no |
  * | rails FX rates / settlement estimate | 2 s | 1  | yes     |
  * | rails evidence (reconciliation) | 10 s | 1      | no      |
  * | compliance `POST /internal/cases` | 3 s | 0 (the case job retries, idempotent) | yes |
- * | rails `POST /internal/executions/{id}/abandon` | 8 s | 0 (the abandon job retries, idempotent) | global |
+ * | rails `POST /internal/executions/{id}/abandon` | 8 s | 0 (the abandon job retries, idempotent) | no |
  * | sentinel `GET /internal/kill-switch` | 2 s | 1      | no      |
  */
 
@@ -103,7 +103,10 @@ export function railsClient(o: PeerOptions & { baseUrl: string }): Rails {
     serviceToken: o.serviceToken,
     ...(o.fetch ? { fetch: o.fetch } : {}),
   };
-  const write = httpClient({ ...common, timeoutMs: 8_000, attempts: 1, breaker: BREAKER });
+  // writes run without a breaker (audit PAYMENTS-2, interim until the kit KIT-2 fix ships): kit 0.3.1's half-open
+  // probe can leak and refuse every later call until a restart. Each write is already bounded (8 s, one attempt) and
+  // retried by its recovery job, so a rails outage costs at most one timed-out call per payer action, not a lockout.
+  const write = httpClient({ ...common, timeoutMs: 8_000, attempts: 1, breaker: false });
   const read = httpClient({ ...common, timeoutMs: 2_000, attempts: 2, breaker: BREAKER });
   // reconciliation reads pages of a whole day: a longer timeout, no breaker shared with checkout reads
   const reconcileRead = httpClient({ ...common, timeoutMs: 10_000, attempts: 2, breaker: false });

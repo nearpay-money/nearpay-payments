@@ -17,7 +17,7 @@
  * behind the copy), logs `ALERT kill_switch_copy_diverged`; gauges `nearpay_payments_kill_switch_*` let deploy
  * alert `KillSwitchCopyDiverged`. Refund paths never wait for sentinel while the state is known.
  */
-import { ApiError } from "@nearpay-internal/service";
+import { ApiError, type BackgroundTask, type Heartbeat } from "@nearpay-internal/service";
 import { compareKillSwitchCopy, DIVERGENCE_FIX, type KillSwitchCopy } from "../domain/kill-switch-copy.js";
 import type { Db, Payments } from "./context.js";
 
@@ -207,18 +207,22 @@ export async function syncKillSwitch(p: Payments, o: { force?: boolean } = {}): 
  * every {@link RESYNC_MS} (periodic read) and refreshes the copy's gauges. The boot read itself is
  * {@link syncKillSwitchAtBoot}.
  */
-export function killSwitchSyncTask(p: Payments, o: { tickMs?: number } = {}) {
+export function killSwitchSyncTask(p: Payments, o: { tickMs?: number } = {}): BackgroundTask {
+  const tickMs = o.tickMs ?? READ_RETRY_MS;
   return {
     name: "kill-switch-sync",
-    start() {
+    // kit 0.6.0 liveness: a tick that never settles fails /healthz (failed sentinel reads still beat)
+    maxSilenceMs: Math.max(12 * tickMs, 120_000),
+    start(heartbeat?: Heartbeat) {
       let stopped = false;
       let timer: NodeJS.Timeout | null = null;
       const tick = async () => {
         if (stopped) return;
         await syncKillSwitch(p).catch(() => "unknown" as const);
-        if (!stopped) timer = setTimeout(tick, o.tickMs ?? READ_RETRY_MS);
+        heartbeat?.beat();
+        if (!stopped) timer = setTimeout(tick, tickMs);
       };
-      timer = setTimeout(tick, o.tickMs ?? READ_RETRY_MS);
+      timer = setTimeout(tick, tickMs);
       return {
         async stop() {
           stopped = true;

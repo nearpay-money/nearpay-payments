@@ -1,6 +1,11 @@
 # nearpay-payments
 
-> Payment lifecycle: checkout sessions, payment intents, attempts, refunds, payment links, customers, statement ledger, reconciliation.
+Payment lifecycle service: checkout sessions, payment intents, attempts, refunds, payment links, customers, statement ledger and reconciliation.
+
+Part of [NearPay](https://github.com/nearpay-money/nearpay) — start there for the live demo, the architecture diagram and the full "do X, see Y" walkthrough.
+
+- **Where it sits:** the gateway routes the public `/v1/checkout`, `/v1/payment_intents`, `/v1/refunds`, `/v1/payment_links`, `/v1/customers` and `/v1/balance_transactions` calls here; billing (invoice sessions) and agentpay (agent attempts) call its internal routes. It calls identity (settlement context), rails (quotes, executions, evidence), compliance, agentpay (relay of signed transfers), sentinel (kill-switch state) and, in test mode, sandbox.
+- **Status:** NearPay runs on NEAR mainnet as a closed beta (https://nearpay.money, API at https://api.nearpay.money). This service is part of that deployment.
 
 |                                       |                                                                                                                                                           |
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -13,16 +18,15 @@
 
 ## Documentation
 
-This repo stays surgical: design docs live in [`nearpay-brain`](../nearpay-brain/README.md), not here.
+Design docs live in [`nearpay-brain`](https://github.com/nearpay-money/nearpay-brain), not here.
 
-- `nearpay-brain/lld/payments.md` — **low-level design (dev-ready; implement from this)**
-- `nearpay-brain/lld/audits/payments.md` — audit findings already folded into the LLD
-- `nearpay-brain/roadmap/development-plan.md` — stage and step this repo is built in
-- `nearpay-brain/architecture/hld.md` — system design
-- `nearpay-brain/architecture/repositories.md` — repo topology and dependency rules
-- `nearpay-brain/architecture/domain-model.md`
-- `nearpay-brain/architecture/flows.md`
-- `nearpay-brain/decisions/ADR-0012-independent-verification.md`
+- [`lld/payments.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/lld/payments.md) — low-level design this service is implemented from
+- [`lld/audits/payments.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/lld/audits/payments.md) — audit findings already folded into the LLD
+- [`roadmap/development-plan.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/roadmap/development-plan.md) — stage and step this repo is built in
+- [`architecture/hld.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/hld.md) — system design
+- [`architecture/repositories.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/repositories.md) — repo topology and dependency rules
+- [`architecture/domain-model.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/domain-model.md) · [`architecture/flows.md`](https://github.com/nearpay-money/nearpay-brain/blob/main/architecture/flows.md)
+- [ADR-0012](https://github.com/nearpay-money/nearpay-brain/blob/main/decisions/ADR-0012-independent-verification.md) (evidence before success) and [ADR-0022](https://github.com/nearpay-money/nearpay-brain/blob/main/decisions/ADR-0022-evm-l2-confirmations.md) (a payment confirms on one block of the chain the settlement evidence is read from)
 
 ## Layout
 
@@ -56,13 +60,27 @@ nearpay-payments/
     └── workflows/
 ```
 
+## Verify this repo
+
+Needs Node 22 (`.nvmrc`) and pnpm 9. `.npmrc` points the `@nearpay-money` and `@nearpay-internal` scopes at a local package registry, so start that first.
+
+1. Start the local registry (no Docker, Node 22 only):
+   `git clone https://github.com/nearpay-money/nearpay-deploy ../nearpay-deploy && ../nearpay-deploy/scripts/registry.sh start`
+   → `curl http://127.0.0.1:4873/-/ping` answers `{}`.
+2. `pnpm install --frozen-lockfile` → ends with `Done in …`, no registry errors.
+3. `pnpm test` (unit and property tests, no Docker) → `Test Files  20 passed (20)`, `Tests  151 passed (151)`.
+4. `pnpm verify` (the full gate: typecheck, lint, unit tests with the coverage gate of ≥ 90 % branches on `src/domain`, integration tests, build) → exits 0. The integration step starts Postgres, NATS and Valkey with Testcontainers, so it needs a running Docker daemon; steps 1–3 do not.
+
+To see this service take a real payment, follow the walkthrough in the [entry repo](https://github.com/nearpay-money/nearpay).
+
 ## Commands
 
 ```sh
-pnpm install                 # @nearpay-money/* from the local registry (nearpay-deploy/scripts/up.sh starts it)
-pnpm verify                  # typecheck, lint, unit + property tests (coverage gate), integration, build
-pnpm test                    # unit + property only (no Docker)
-pnpm test:integration        # Testcontainers (Postgres, NATS, Valkey) + spec contract tests
+pnpm install --frozen-lockfile   # NearPay packages from the local registry (see "Verify this repo")
+pnpm verify                      # typecheck, lint, unit + property tests (coverage gate), integration, build
+pnpm test                        # unit + property only (no Docker)
+pnpm test:integration            # Testcontainers (Postgres, NATS, Valkey) + spec contract tests
+pnpm build                       # tsc → dist/
 node dist/main.js api|worker|migrate|healthcheck
 ```
 
@@ -125,9 +143,9 @@ node dist/main.js api|worker|migrate|healthcheck
 - **Executions of other owners** (`Execution.owner ≠ payments`, agentpay's x402) are acknowledged without effect;
   reconciliation lists `listEvidence?owner=payments` and checks the count against rails' all-owner summary.
 
-## Ops CLI (Stage 1)
+## Ops CLI
 
-`docker compose -p nearpay exec payments-api /nodejs/bin/node dist/ops.js <command>`: `intent <pi_…>`, `session <cs_…>`, `attempt-recover <pa_…>`, `context-refresh <acct_…> [--live]`, `stuck`.
+`docker compose -p nearpay exec payments-api /nodejs/bin/node dist/ops.js <command>`: `intent <pi_…>`, `session <cs_…>`, `attempt-recover <pa_…>`, `context-refresh <acct_…> [--live]`, `stuck`, and the kit 0.6.0 commands `dead-letters …` and `outbox …`.
 
 ## Status
 
@@ -136,6 +154,13 @@ spec including the `/ops` console routes, the 16 consumed subjects, the 17 produ
 3.2, spec 0.3.0, kit 0.2.1): internal invoice sessions and customer read, the checkout-session pay test helper,
 foreign-owner executions ignored, owner-filtered reconciliation (migration `0005_stage3_invoices.sql`).
 
+Current pins (`package.json`): `@nearpay-money/spec` 0.5.0 and the `@nearpay-internal/*` kit packages at 0.6.0
+(supervised consumers, liveness from loop heartbeats, outbox dead-letter).
+
 ## Built with
 
-Fastify, Kysely, pg, NATS, ioredis (via `@nearpay-internal/*`), zod, canonicalize; Vitest, fast-check, Testcontainers, Biome. Code and documentation are written with AI assistance (Claude) under human direction and review.
+- Runtime: TypeScript on Node 22; Fastify, Kysely and pg, NATS (through the `@nearpay-internal/*` kit packages); ioredis (Valkey), zod, canonicalize; contracts from `@nearpay-money/spec`.
+- Tests and tooling: Vitest, fast-check, Testcontainers, Biome.
+- Licence: Apache-2.0 (`LICENSE`).
+
+Code and documentation are written with AI assistance (Claude) under human direction and review. Built for the NEAR Hackathon (Nov 2026).

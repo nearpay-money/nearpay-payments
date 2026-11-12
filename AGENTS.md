@@ -1,6 +1,6 @@
 # AGENTS.md — nearpay-payments
 
-You are working in **nearpay-payments**, one of 27 NearPay repositories (`nearpay-brain/architecture/repositories.md`).
+You are working in **nearpay-payments**, one of 26 NearPay repositories (`nearpay-brain/architecture/repositories.md`).
 Scope: Payment lifecycle: checkout sessions, payment intents, attempts, refunds, payment links, customers, statement ledger, reconciliation.
 
 ## Before changing anything

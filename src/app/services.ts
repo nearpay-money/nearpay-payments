@@ -63,7 +63,7 @@ import { type Notifier, notifier } from "../infra/notifier.js";
 import { memoryLimiter, type RateLimiter, rateLimiter } from "../infra/rate-limiter.js";
 import { jobHandlers, RECURRING } from "../workers/jobs.js";
 import { newCaches, noMetrics, type Payments, paymentsMetrics } from "./context.js";
-import { syncKillSwitchAtBoot } from "./kill-switch.js";
+import { killSwitchSyncTask, syncKillSwitchAtBoot } from "./kill-switch.js";
 
 export interface ServiceDeps {
   database?: Database<DB>;
@@ -216,6 +216,8 @@ export function createApi(config: ApiConfig, deps: ServiceDeps = {}): { service:
   attach(b, service, deps);
   // the api refuses live refunds while the state is unknown: read sentinel's at boot (spec 0.2.1)
   void syncKillSwitchAtBoot(b.payments);
+  // PAYMENTS-1: re-read sentinel every 60 s even while the state is known (a missed event self-heals)
+  service.addBackground(killSwitchSyncTask(b.payments));
   return { service, payments: b.payments };
 }
 
@@ -236,6 +238,7 @@ export async function createWorker(
   // read sentinel's state at boot when the stored one is unknown (spec 0.2.1); while it stays unknown live
   // refunds stay paused until the consumer applies `evt.sentinel.kill_switch.*` (finding 8)
   await syncKillSwitchAtBoot(p);
+  service.addBackground(killSwitchSyncTask(p));
 
   const bus = deps.bus ?? (await connectBus({ url: config.natsUrl, name: `payments-worker@${hostname()}` }));
   await ensureStreams(bus, [STREAMS.payments]);

@@ -13,7 +13,7 @@ import { createRefundExecution, relaySignedIntent } from "@nearpay-internal/spec
 import { domainEvent, expectEvent, mockError } from "@nearpay-internal/testing";
 import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { syncKillSwitchAtBoot } from "../../src/app/kill-switch.js";
+import { readKillSwitch, storeKillSwitch, syncKillSwitch, syncKillSwitchAtBoot } from "../../src/app/kill-switch.js";
 import { valkeyLimiter } from "../../src/infra/rate-limiter.js";
 import { type Merchant, type Stack, startStack, USDC_BASE, USDC_NEAR, uuid } from "../support/stack.js";
 import { agentpayRelayBody, type Evidence, freshEvidence, type PaidIntent } from "../support/stage2.js";
@@ -1277,6 +1277,63 @@ describe('spec 0.2.1 (lld/payments.md §"Spec 0.2.1 contract changes")', () => {
       await waitFor(async () => (await killSwitchRow())?.engaged === false);
       expect((await refund()).status).toBe(201);
     } finally {
+      st.killSwitchRead = null;
+    }
+  });
+
+  it("periodic read (PAYMENTS-1): a missed release self-heals, an older answer never wins, a failed re-read keeps the state", async () => {
+    const logs: { level: string; fields: Record<string, unknown>; msg: string }[] = [];
+    const real = st.payments.log;
+    const at = (level: string) => (fields: Record<string, unknown> | string, msg?: string) => {
+      logs.push(typeof fields === "string" ? { level, fields: {}, msg: fields } : { level, fields, msg: msg ?? "" });
+    };
+    st.payments.log = { ...real, warn: at("warn"), info: at("info"), error: at("error") } as typeof real;
+    const gauge = async (series: string) => {
+      const text = await st.api.metrics.render();
+      const line = text.split("\n").find((l) => l.startsWith(`${series} `));
+      return line === undefined ? undefined : Number(line.slice(series.length + 1));
+    };
+    const longAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+    try {
+      // payments holds engaged v7000; sentinel released v7001 ten minutes ago and the event never arrived
+      await storeKillSwitch(st.admin.db, { engaged: true, version: 7000, reason: "drill" });
+      st.killSwitchRead = { engaged: false, version: 7001, reason: "released", updated_at: longAgo };
+      expect(await readKillSwitch(st.payments)).toBe("engaged"); // refund paths do not ask sentinel while known
+      expect(await syncKillSwitch(st.payments, { force: true })).toBe("released");
+      expect(await killSwitchRow()).toMatchObject({ engaged: false, version: 7001 });
+      expect(logs.find((l) => l.msg.startsWith("ALERT kill_switch_copy_diverged"))).toMatchObject({
+        level: "warn",
+        fields: { cause: "copy_behind", resolved: true },
+      });
+      expect(await gauge("nearpay_payments_kill_switch_version")).toBe(7001);
+      expect(await gauge("nearpay_payments_kill_switch_source_version")).toBe(7001);
+      expect(await gauge("nearpay_payments_kill_switch_engaged")).toBe(0);
+      expect(await gauge("nearpay_payments_kill_switch_diverged")).toBe(0);
+      // the reverse: a missed engage applies at the next read
+      st.killSwitchRead = { engaged: true, version: 7002, reason: "drill 2", updated_at: longAgo };
+      expect(await syncKillSwitch(st.payments, { force: true })).toBe("engaged");
+      // an older answer never wins: no change, ALERT sentinel_behind, diverged = 1
+      logs.length = 0;
+      st.killSwitchRead = { engaged: false, version: 6000, reason: "old" };
+      expect(await syncKillSwitch(st.payments, { force: true })).toBe("engaged");
+      expect(await killSwitchRow()).toMatchObject({ engaged: true, version: 7002 });
+      expect(logs.find((l) => l.msg.startsWith("ALERT kill_switch_copy_diverged"))).toMatchObject({
+        fields: { cause: "sentinel_behind" },
+      });
+      expect(await gauge("nearpay_payments_kill_switch_diverged")).toBe(1);
+      // sentinel unreachable while known: the state stays
+      st.killSwitchRead = null;
+      expect(await syncKillSwitch(st.payments, { force: true })).toBe("engaged");
+      expect(logs.some((l) => l.msg.startsWith("kill switch could not be re-read"))).toBe(true);
+      // sentinel releases (v7003, just now): applied without ALERT (its event is in flight), the copy agrees again
+      logs.length = 0;
+      st.killSwitchRead = { engaged: false, version: 7003, reason: "done" };
+      expect(await syncKillSwitch(st.payments, { force: true })).toBe("released");
+      expect(logs.some((l) => l.msg.startsWith("ALERT"))).toBe(false);
+      expect(logs.some((l) => l.msg === "kill switch copy agrees with sentinel again")).toBe(true);
+      expect(await gauge("nearpay_payments_kill_switch_diverged")).toBe(0);
+    } finally {
+      st.payments.log = real;
       st.killSwitchRead = null;
     }
   });
